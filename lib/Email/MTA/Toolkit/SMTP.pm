@@ -1,5 +1,6 @@
 package Email::MTA::Toolkit::SMTP;
 use Exporter::Extensible -exporter_setup => 1;
+use Carp;
 
 =head1 SYNOPSIS
 
@@ -70,6 +71,35 @@ use Exporter::Extensible -exporter_setup => 1;
   $server->io->{wbuf}= '';
   my $res= $client->parse_response;
   
+=cut
+
+our %COMMANDS;
+
+require Email::MTA::Toolkit::SMTP::Request;
+our $request_class= 'Email::MTA::Toolkit::SMTP::Request';
+
+sub request_class {
+   my $self= shift;
+   if (ref $self) {
+      $self->{request_class}= shift if @_;
+      return $self->{request_class} if $self->{request_class};
+      $self= ref $self;
+   }
+   $self eq __PACKAGE__? $request_class : $self->_get_inherited_class_attr('request_class');
+}
+sub _get_inherited_class_attr {
+   my ($class, $attr)= @_;
+   for (@{ mro::get_linear_isa($class) }) {
+      no strict 'refs';
+      return ${"${class}::$attr"} if defined ${"${class}::$attr"};
+   }
+   return undef;
+}
+
+sub new_request {
+   my $self= shift;
+   return $self->request_class->new(protocol => $self, %{ $_[0] });
+}
 
 =head1 PARSE FUNCTIONS
 
@@ -89,7 +119,7 @@ command and return a hashref, where errors are reported as C<< $result->{error} 
 
 sub parse_cmd_if_complete {
    my $class= shift;
-   return undef unless /\G((\S+).*?(\r?\n))/gc;
+   return undef unless /\G((\S*).*?(\r?\n))/gc;
    my ($line, $cmd, $eol)= ($1, uc $2, $3);
    my $ret;
    if (my $m= $class->can("parse_cmd_$cmd")) {
@@ -99,7 +129,7 @@ sub parse_cmd_if_complete {
    }
    push @{$ret->{warnings}}, 'Missing CR at end of line'
       unless $eol eq "\r\n";
-   $ret;
+   return $ret;
 }
 
 =head2 parse_domain
@@ -138,14 +168,14 @@ sub parse_forward_path {
    my $self= shift;
    my @path;
    /\G < /gcx or return undef;
-   if (/\G \@ /gcx && defined(my $d= $self->_parse_domain)) {
+   if (/\G \@ /gcx && defined(my $d= $self->parse_domain)) {
       push @path, $d;
-      while (/\G ,\@ /gcx && defined($d= $self->_parse_domain)) {
+      while (/\G ,\@ /gcx && defined($d= $self->parse_domain)) {
          push @path, $d;
       }
       /\G : /gcx or return undef;
    }
-   my $m= $self->_parse_mailbox
+   my $m= $self->parse_mailbox
       or return undef;
    /\G > /gcx or return undef;
    push @path, $m;
@@ -191,6 +221,17 @@ sub parse_mailbox {
    /\G( \S+ \@ \w[-\w]* (?: \. \w[-\w]* )* )/gcx? $1 : undef;
 }
 
+=head2 format_cmd
+
+=cut
+
+sub format_cmd {
+   my ($self, $req)= @_;
+   my $m= $self->can("format_cmd_$req->{command}")
+      or croak "Don't know how to format a $req->{command} message";
+   $m->($self, $req);
+}
+
 =head1 COMMANDS
 
 =head2 EHLO
@@ -213,14 +254,14 @@ sub parse_cmd_EHLO {
    my $self= shift;
    my $host;
    /\GEHLO /gci
-   && defined($host= ($self->_parse_host_addr // $self->_parse_domain))
+   && defined($host= ($self->parse_host_addr // $self->parse_domain))
    && /\G *(?=\r?\n)/gc
       or return { error => "500 Invalid EHLO syntax" };
    return { command => 'EHLO', host => $host }
 }
 
 sub format_cmd_EHLO {
-   "EHLO ".$_[0]{host};
+   "EHLO ".$_[1]{host};
 }
 
 =head2 HELO
@@ -251,7 +292,7 @@ sub parse_cmd_HELO {
 }
 
 sub format_cmd_HELO {
-   "HELO ".$_[0]{host};
+   "HELO ".$_[1]{host};
 }
 
 =head2 MAIL
@@ -313,6 +354,7 @@ sub parse_cmd_MAIL {
 }
 
 sub format_cmd_MAIL {
+   my $self= shift;
    my ($path,$params)= @{$_[0]}{'path','parameters'};
    $path= join ',', @$path if ref $path eq 'ARRAY';
    !$params || !keys %$params? "MAIL FROM:<$path>"
@@ -367,11 +409,12 @@ It pushes the new path onto the C<to> attribute, then returns a 250 reply.
 sub rcpt_to {
    my ($self, $path, $params)= @_;
    $path= [ $path ] unless ref $path eq 'ARRAY';
-   $self->send_command({ command => 'RCPT', path => $path, parameters => $parameters });
+   $self->send_command({ command => 'RCPT', path => $path, parameters => $params });
 }
 
 sub parse_cmd_RCPT {
    my $self= shift;
+   my ($path, $params);
    /\GRCPT TO:/gci
    && defined($path= $self->parse_forward_path)
    && (!/\G *(?=\S)/gc || ($params= $self->parse_rcpt_parameters))
@@ -381,6 +424,7 @@ sub parse_cmd_RCPT {
 }
 
 sub format_cmd_RCPT {
+   my $self= shift;
    my ($path, $params)= @{$_[0]}{'path','parameters'};
    $path= join ',', @$path if ref $path eq 'ARRAY';
    !$params || !keys %$params? "RCPT TO:<$path>"
@@ -408,12 +452,12 @@ sub handle_cmd_RCPT {
 =cut
 
 sub parse_cmd_QUIT {
-   /\GQUIT\s*(?=\r?\n)/gc
+   /\GQUIT *(?=\r?\n)/gc
       or return { error => "500 Invalid QUIT syntax" };
    return { command => 'QUIT' }
 }
 sub format_cmd_QUIT {
    "QUIT";
 }
- 
+
 1;

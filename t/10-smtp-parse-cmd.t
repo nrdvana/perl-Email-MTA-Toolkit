@@ -1,8 +1,8 @@
 #! /usr/bin/env perl
-use Test2::V0;
-use Email::MTA::Toolkit::SMTP::Request;
+use Test::More;
+use Email::MTA::Toolkit::SMTP;
 
-my $CLASS= 'Email::MTA::Toolkit::SMTP::Request';
+my $smtp= 'Email::MTA::Toolkit::SMTP';
 
 my @tests= (
    [ 'HELO example.com' => 'HELO example.com' ],
@@ -14,8 +14,14 @@ my @tests= (
 
 for (@tests) {
    my ($orig, $canonical)= @$_;
-   my ($msg, $err)= $CLASS->parse($orig."\r\n");
-   is( (defined $msg? "$msg" : $err), $canonical, $orig );
+   my $req;
+   $req= $smtp->parse_cmd_if_complete for $orig."\r\n";
+   if ($req->{command}) {
+      is_deeply( $smtp->format_cmd($req), $canonical, $orig );
+   } else {
+      diag explain $req;
+      fail( $orig );
+   }
 }
 
 done_testing;
