@@ -1,5 +1,5 @@
 package Email::MTA::Toolkit::SMTP;
-use Exporter::Extensible -exporter_setup => 1;
+use Moo;
 use Carp;
 
 =head1 SYNOPSIS
@@ -75,41 +75,134 @@ use Carp;
 
 our %COMMANDS;
 
+=head1 RELATED OBJECTS
+
+Parts of the SMTP protocol can be wrapped with objects, for the higher level APIs,
+such as requests and responses.  These wrapper objects refer back to the SMTP
+instance to perform any protocol-related work.  The SMTP object has attributes
+to configure which class gets used for the wrapper objects.
+
+=head2 Request
+
+This object wraps a command sent from client to server.
+See L<Email::MTA::Toolkit::SMTP::Request>.
+
+=over
+
+=item request_class
+
+The name of the class to create for Requests.
+This is both a read-only class attribute and a read/write instance attribute.
+
+=item new_request
+
+  ->new_request( \%attributes );
+  ->new_request( %attributes );
+  ->new_request( $protocol_line );
+
+This is a convenient way to create Request objects.  When given %attributes,
+it is just a short-hand for C<< $smtp->request_class->new(...) >>.  When given
+a C<$protocol_line> it first parses the line (dying if the parse fails) and
+then uses the attributes from the parse.  Unlike the parse methods, this does
+not modify the caller's buffer.
+
+=back
+
+=cut
+
 require Email::MTA::Toolkit::SMTP::Request;
-our $request_class= 'Email::MTA::Toolkit::SMTP::Request';
+sub _build_request_class { 'Email::MTA::Toolkit::SMTP::Request' }
 
 sub request_class {
    my $self= shift;
    if (ref $self) {
       $self->{request_class}= shift if @_;
-      return $self->{request_class} if $self->{request_class};
-      $self= ref $self;
-   }
-   $self eq __PACKAGE__? $request_class : $self->_get_inherited_class_attr('request_class');
-}
-sub _get_inherited_class_attr {
-   my ($class, $attr)= @_;
-   for (@{ mro::get_linear_isa($class) }) {
+      return $self->{request_class} ||= $self->_build_request_class;
+   } else {
+      croak "Read-only accessor" if @_;
       no strict 'refs';
-      return ${"${class}::$attr"} if defined ${"${class}::$attr"};
+      ${"${self}::request_class"} ||= $self->_build_request_class;
    }
-   return undef;
 }
 
 sub new_request {
    my $self= shift;
-   return $self->request_class->new(protocol => $self, %{ $_[0] });
+   my @attrs= @_ == 1 && ref $_[0] eq 'HASH'? %{$_[0]}
+      # Convenience helper: passing a single string means to parse that string.
+      : @_ == 1 && !ref $_[0]? do {
+         my $line= shift;
+         $line .= "\n" unless $line =~ /\n\Z/;
+         my $req= $self->parse_cmd_if_complete($line);
+         croak "Failed to parse command: ".$req->{error}
+            if defined $req->{error};
+         %$req;
+      }
+      : @_;
+   $self->request_class->new(@attrs, protocol => $self);
 }
 
-=head1 PARSE FUNCTIONS
+=head2 Response
 
-Each of these functions operates on C<$_> starting at C<pos($_)> (using the \G
-feature of the regex engine).  The first argument must be a class, where related
-parse methods can be found.
+This object wraps a reply sent from server to client.
+See L<Email::MTA::Toolkit::SMTP::Response>.
+
+=over
+
+=item response_class
+
+The name of the class to use for wrapping Responses.
+This is both a read-only class attribute and a read/write instance attribute.
+
+=item new_response
+
+  ->new_response( \%attributes );
+  ->new_response( %attributes );
+  ->new_response( $code, @messages );
+
+This is a convenient way to create Response objects.  When given %attributes,
+it is just a short-hand for C<< $smtp->response_class->new(...) >>.  When given
+a C<$code> and C<@messages>, these are used as the C<code> and C<messages>
+attributes.
+
+=back
+
+=cut
+
+require Email::MTA::Toolkit::SMTP::Response;
+sub _build_request_class { 'Email::MTA::Toolkit::SMTP::Response' }
+
+sub response_class {
+   my $self= shift;
+   if (ref $self) {
+      $self->{response_class}= shift if @_;
+      return $self->{response_class} ||= $self->_build_response_class;
+   } else {
+      croak "Read-only accessor" if @_;
+      no strict 'refs';
+      ${"${self}::response_class"} ||= $self->_build_response_class;
+   }
+}
+
+sub new_response {
+   my $self= shift;
+   my @attrs= @_ == 1 && ref $_[0] eq 'HASH'? %{$_[0]}
+      : @_ > 0 && length($_[0]) == 3 && $_[0] =~ /[0-9]{3}/? ( code => $_[0], messages => [ @_[1..$#_] ] )
+      : @_;
+   $self->response_class->new(@attrs, protocol => $self);
+}
+
+=head1 PARSE METHODS
+
+Each of these class methods operates on C<$_> starting at C<pos($_)>
+(using the \G feature of the regex engine).
+They modify the C<pos> of C<$_>, allowing you to continue parsing a
+buffer without modifying it.
 
 =head2 parse_cmd_if_complete
 
   for ($buffer) { my $out= $class->parse_cmd_if_complete }
+  # or
+  my $out= $class->parse_cmd_if_complete($buffer);
 
 If the buffer C<$_> from C<pos> does not contain a '\n' character, assume the
 command is incomplete and return C<undef> instead of an error.  Else parse the
@@ -119,13 +212,18 @@ command and return a hashref, where errors are reported as C<< $result->{error} 
 
 sub parse_cmd_if_complete {
    my $class= shift;
+   if (@_) {
+      # Function operates on $_, not @_, but be nice to callers who try
+      # to pass the buffer as an argument.
+      return $class->parse_cmd_if_complete for $_[0];
+   }
    return undef unless /\G((\S*).*?(\r?\n))/gc;
    my ($line, $cmd, $eol)= ($1, uc $2, $3);
    my $ret;
    if (my $m= $class->can("parse_cmd_$cmd")) {
       $ret= $class->$m for $line;
    } else {
-      $ret= { error => qq{500 Unknown command "$cmd"} };
+      $ret= { error => [ 500, qq{Unknown command "$cmd"} ] };
    }
    push @{$ret->{warnings}}, 'Missing CR at end of line'
       unless $eol eq "\r\n";
@@ -134,6 +232,7 @@ sub parse_cmd_if_complete {
 
 =head2 parse_domain
 
+Class method.
 Match C<$_> from C<pos> vs. the RFC 5321 specification of a 'Domain', returning
 the domain on a match, or undef otherwise.
 
@@ -145,6 +244,7 @@ sub parse_domain {
 
 =head2 parse_host_addr
 
+Class method.
 Match C<$_> from C<pos> vs. the RFC 5321 specification of literal IP address
 notation in '[]' brackets.  Returns the address including brackets on success,
 or undef on failure.
@@ -158,6 +258,7 @@ sub parse_host_addr {
 
 =head2 parse_forward_path
 
+Class method.
 Match C<$_> from C<pos> vs. the RFC 5321 specification for the 'forward-path'
 of the RCPT command.  Returns an arrayref of the path components on success,
 or undef on mismtch.
@@ -165,17 +266,17 @@ or undef on mismtch.
 =cut
 
 sub parse_forward_path {
-   my $self= shift;
+   my $class= shift;
    my @path;
    /\G < /gcx or return undef;
-   if (/\G \@ /gcx && defined(my $d= $self->parse_domain)) {
+   if (/\G \@ /gcx && defined(my $d= $class->parse_domain)) {
       push @path, $d;
-      while (/\G ,\@ /gcx && defined($d= $self->parse_domain)) {
+      while (/\G ,\@ /gcx && defined($d= $class->parse_domain)) {
          push @path, $d;
       }
       /\G : /gcx or return undef;
    }
-   my $m= $self->parse_mailbox
+   my $m= $class->parse_mailbox
       or return undef;
    /\G > /gcx or return undef;
    push @path, $m;
@@ -184,6 +285,7 @@ sub parse_forward_path {
 
 =head2 parse_reverse_path
 
+Class method.
 Match C<$_> from C<pos> vs. the rFC 5321 specification for the 'reverse-path'
 of the MAIL command.  (this is the same as the forward-path except it may be
 an empty list, returning an empty arrayref).
@@ -191,12 +293,13 @@ an empty list, returning an empty arrayref).
 =cut
 
 sub parse_reverse_path {
-   my $self= shift;
-   /\G <> /gcx? [] : $self->parse_forward_path
+   my $class= shift;
+   /\G <> /gcx? [] : $class->parse_forward_path
 }
 
 =head2 parse_mail_parameters
 
+Class method.
 Match C<$_> from C<pos> vs. the RFC 5321 specification for the "esmtp mail
 parameters" which are optional arguments to the MAIL and RCPT commands.
 
@@ -207,11 +310,15 @@ parameters lacking an equal sign.  Returns undef on a parse error.
 
 sub parse_mail_parameters {
    # TODO: implement this as a proper parse that fails on errors
-   { map { my $p= index $_, '='; $p > 0? (substr($_,0,$p) => substr($_,$p+1)) : ($_ => undef) } split / /, substr($_, pos) }
+   { map {
+      my $p= index $_, '=';
+      $p > 0? (substr($_,0,$p) => substr($_,$p+1))
+         : ($_ => undef)
+   } split / /, substr($_, pos) }
 }
 
 sub format_mail_parameters {
-   my ($self, $p)= @_;
+   my ($class, $p)= @_;
    join ' ', map { defined $p->{$_}? "$_=$p->{$_}" : "$_" } keys %$p;
 }
 *parse_rcpt_parameters= *parse_mail_parameters;
@@ -232,13 +339,72 @@ sub format_cmd {
    $m->($self, $req);
 }
 
+=head1 STATES
+
+The SMTP protocol has a 'state' attribute, with the following possible values:
+
+=over
+
+=item C<''>
+
+The empty initial state means nothing has happened yet.  It can transition to
+'handshake' or 'reject'.
+L<https://datatracker.ietf.org/doc/html/rfc5321#section-3.1>
+
+=item C<'handshake'>
+
+For the server, sending a 220 transitions to 'handshake',
+and for the client, receiving 220 transitions to 'handshake'.
+The client replies with HELO or EHLO and the server waits for it.
+The following state is 'ready'.
+
+=item C<'reject'>
+
+If the server opens communication with an initial 554, this state means the
+server has rejected the client, and no commands are allowed except 'QUIT'.
+
+=item C<'ready'>
+
+After the server receives HELO/EHLO and the client receives a '250' reply, both
+transition to state 'ready'.  This means mail transactions can begin with the
+'MAIL' command.  It also arrives at this state after RSET.
+
+=item C<'mail'>
+
+After the server receives the 'MAIL' command and the client receives the '250'
+reply, the state changes to 'mail'.  The client can then send any number of
+RCPT commands to build the rest of the envelope address list.  The next state
+is 'data'.
+
+=item C<'data'>
+
+After the server receives the 'DATA' command and the client receives the 354
+reply, the state changes to 'data'. The command parsing changes here to accept
+lines of raw 8-bit with the special "leading dot" terminator.  After the final
+line, the server makes a decision whether to accept the mail and the state
+transitions back to 'ready' (for a new transaction).
+
+=item C<'quit'>
+
+After the client sends a 'QUIT' command and the server receives it, the state
+transitions to 'QUIT' and all further commands are rejected.
+
+=back
+
 =head1 COMMANDS
 
 =head2 EHLO
 
-The modern session-initiation command.
+The modern session-initiation command.  This is allowed in any state except
+'reject', 'starttls', 'auth', and 'quit'.
 
 =over
+
+=item ehlo
+
+  $request= $smtp->ehlo($domain);
+
+Shortcut for calling L</send_command>.
 
 =item parse_cmd_EHLO
 
@@ -246,9 +412,30 @@ Returns a hash of C<< { command => 'EHLO', host => $host } >>
 
 =item format_cmd_EHLO
 
+Returns canonical encoding of the ehlo command.
+
+=item handle_cmd_EHLO
+
+This sets the C<client_domain> attribute and clears any current transaction,
+and runs the C<on_handshake> callback (if set).  Then it returns a 250 reply
+including all the keywords in the L</ehlo_keywords> attribute.
+
 =back
 
 =cut
+
+$COMMANDS{EHLO}= {
+   states => { handshake => 1, ready => 1, mail => 1, data => 1 },
+};
+
+sub ehlo {
+   my ($self, $domain, $keywords)= @_;
+   $self->send_command({ command => 'HELO', domain => $domain });
+}
+
+sub format_cmd_EHLO {
+   "EHLO ".$_[1]{host};
+}
 
 sub parse_cmd_EHLO {
    my $self= shift;
@@ -260,8 +447,22 @@ sub parse_cmd_EHLO {
    return { command => 'EHLO', host => $host }
 }
 
-sub format_cmd_EHLO {
-   "EHLO ".$_[1]{host};
+sub handle_cmd_EHLO {
+   my ($self, $command)= @_;
+   $self->client_domain($command->{domain});
+   $self->clear_transaction();
+   if ($self->on_handshake) {
+      $self->on_handshake->($self, $command);
+   }
+   my @ret= ( 250, $self->server_domain );
+   for (sort keys %{ $self->ehlo_keywords }) {
+      my ($k, $v)= ($_, $self->ehlo_keywords->{$_});
+      push @keywords, join ' ', $_,
+         ref $v eq 'ARRAY'? @$v
+         : defined $v && length $v? ($v)
+         : ();
+   }
+   return \@ret;
 }
 
 =head2 HELO
@@ -271,15 +472,42 @@ but all clients should use EHLO.
 
 =over
 
+=item helo
+
+  $request= $smtp->helo($domain);
+
+Shortcut for calling L</send_command>.
+
+=item format_cmd_HELO
+
+Returns the canonical HELO string (without CRLF) from a hashref.
+
 =item parse_cmd_HELO
 
 Returns a hash of C<< { command => 'HELO', host => $host } >>
 
-=item format_cmd_EHLO
+=item handle_cmd_HELO
+
+This sets the C<client_domain> attribute and sets the C<ehlo_keywords>
+to an empty hashref, clears any current transaction, and runs the
+C<on_handshake> callback (if set).  Then it returns a 250 reply.
 
 =back
 
 =cut
+
+$COMMANDS{HELO}= {
+   states => { handshake => 1, ready => 1, mail => 1, data => 1 },
+};
+
+sub helo {
+   my ($self, $domain)= @_;
+   $self->send_command({ command => 'HELO', domain => $domain });
+}
+
+sub format_cmd_HELO {
+   "HELO ".$_[1]{host};
+}
 
 sub parse_cmd_HELO {
    my $self= shift;
@@ -291,8 +519,15 @@ sub parse_cmd_HELO {
    return { command => 'HELO', host => $host }
 }
 
-sub format_cmd_HELO {
-   "HELO ".$_[1]{host};
+sub handle_cmd_HELO {
+   my ($self, $command)= @_;
+   $self->client_domain($command->{domain});
+   $self->ehlo_keywords({});
+   $self->clear_transaction();
+   if ($self->on_handshake) {
+      $self->on_handshake->($self, $command);
+   }
+   return [ 250, $self->server_domain ];
 }
 
 =head2 MAIL
@@ -333,7 +568,7 @@ and C<data> file handle, then returns a 250 reply.
 =cut
 
 $COMMANDS{MAIL}= {
-   states => { session => 1 },
+   states => { ready => 1 },
 };
 
 sub mail_from {
@@ -406,6 +641,10 @@ It pushes the new path onto the C<to> attribute, then returns a 250 reply.
 
 =cut
 
+$COMMANDS{MAIL}= {
+   states => { mail => 1 },
+};
+
 sub rcpt_to {
    my ($self, $path, $params)= @_;
    $path= [ $path ] unless ref $path eq 'ARRAY';
@@ -437,6 +676,164 @@ sub handle_cmd_RCPT {
       unless $self->commands->{RCPT}{states}{$self->state};
    push @{$self->to}, $command->{path};
    return [ 250, 'OK' ];
+}
+
+=head2 DATA
+
+=over
+
+=item data
+
+  $request= $smtp->data($text);
+  $request= $smtp->data(\$text);
+  $request= $smtp->data($filehandle);
+  $request= $smtp->data(\@lines);
+
+Send the DATA command.  Arguments will be queued like from the L</more_data>
+command, but no data lines will be sent until the server replies a 354
+"continue" response to the DATA command.  After the data transfer is complete,
+the C<$request> gets updated again with either a success or failure reply.
+
+If you supply data arguments to this method, it is assumed they hold the
+complete data, and you cannot then call L</more_data> or L</end_data>.
+
+=item more_data
+
+  $smtp->more_data($text);
+  $smtp->more_data(\$text);
+  $smtp->more_data($filehandle);
+  $smtp->more_data(\@lines);
+
+Queue additional data or data lines.
+
+Parameters of C<$text> or C<\$text> are treated as a buffer.  The buffer is
+split on "\n", and all lines get "upgraded" to "\r\n" line endings.
+
+A parameter of C<$filehandle> gets read and split like a literal data buffer.
+
+An arrayref parameter gets treated as individual text lines, where each line
+is upgraded to end with "\r\n" (even if it had no previous line ending) and
+occurrence of "\n" or "\r" anywhere in the middle of the string is an error.
+
+All strings should be 7-bit ascii, unless an 8-bit extension was negotiated.
+
+=item end_data
+
+  $smtp->end_data
+
+Call this after the last L</more_data>, to indicate the end of the data and
+allow the terminating line to be sent.
+
+=item format_cmd_DATA
+
+Always returns "DATA\r\n"
+
+=item parse_cmd_DATA
+
+Parses C<$_> from C<pos>, accepting only "DATA\r\n".
+
+=item handle_cmd_DATA
+
+If there is a sender and at least one recipient, this changes the server state
+to 'data', and sends a 354 response.  Else it returns an appropriate error code.
+State 'data' changes from parsing commands to parsing data lines
+(L</parse_data>, L</handle_data>, L</handle_data_end>).
+
+=item parse_data
+
+  $found= $smtp->parse_data_lines($buffer);
+  # {
+  #   literal_blocks => [ $start_pos, $length, $start_pos2, $length2, ... ],
+  #   complete => $bool,
+  # }
+
+Inspects a buffer and identifies contiguous strings of data that can be copied
+to the output.  The positions and lengths are intended for C<substr($buffer, $pos, $len)>,
+or for calls to C<syswrite>.  If the end of data marker is found, this also
+sets the 'complete' flag to a true value.
+
+=item handle_data
+
+Takes the result of 'parse_data' and copies segments of the buffer into a
+scalar if they are smaller than the "message_in_mem_limit", or writes them
+out to a temporary file handle if they are greater than that limit.
+The scalar or data handle are stored at C<< $smtp->mail_transaction->{data} >>.
+
+=item handle_data_end
+
+Upon completion of receiving the data, this method is called, and in turn
+calls the on_data_end callback (if any).  It then assumes the transaction is
+complete, and calls L</handle_mail_transaction>.
+
+=item handle_mail_transaction
+
+This first calls the on_message calback, which may return a response.  If it
+doesn't (or no callback is set) this returns an error code that the message was
+not accepted.  It also clears the L</mail_transaction> attribute and changes
+the state from 'mail' to 'ready', before returning.
+
+The user of this module must either supply a L</on_message> callback, or override
+the return value of this method in order to accept any mail.
+
+=back
+
+=cut
+
+$COMMANDS{DATA}= {
+   states => { mail => 1 },
+};
+
+sub data {
+   my $self= shift;
+   my $req= $self->send_command({ command => 'DATA' });
+   if (@_) {
+      $self->more_data(@_);
+      $self->end_data;
+   }
+   return $req;
+}
+
+sub more_data {
+   my $self= shift;
+   $self->state eq 'data'
+      or croak "more_data can only be called after sending DATA command";
+   if (@_ == 1 && (!ref $_[0] || ref $_[0] eq 'SCALAR')) {
+      push @{$self->mail_transaction->{data_queue}}, $_[0];
+   } elsif (@_ == 1 && ref $_[0] eq 'ARRAY') {
+      my @data= @{$_[0]};
+      for (@data) {
+         /[\r\n]./ and croak "Embedded newline in lines of text";
+         s/\r?\n?$/\r\n/
+      }
+      push @{$self->mail_transaction->{data_queue}}, join '', @data;
+   } else {
+      croak "Too many arguments to more_data: ".scalar(@_) if @_ > 1;
+      croak "Unhandled more_data arguments  (@_)";
+   }
+}
+
+sub end_data {
+   my $self= shift;
+   $self->state eq 'data'
+      or croak "end_data can only be called after sending DATA command";
+   $self->mail_transaction->{data_complete}= 1;
+}
+
+sub format_cmd_DATA {
+   "DATA\r\n";
+}
+
+sub parse_cmd_DATA {
+   /\GDATA *(?=\r?\n)/gc
+      or return { error => "500 Invalid DATA syntax" };
+   return { command => 'DATA' };
+}
+
+sub handle_cmd_DATA {
+   my $self= shift;
+   my $ret= !@{$self->mail_transaction->{recipients}}? [ ... ]
+      : [ ... ]
+   ...
 }
 
 =head2 QUIT

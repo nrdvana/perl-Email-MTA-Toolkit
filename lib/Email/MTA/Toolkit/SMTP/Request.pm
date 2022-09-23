@@ -36,7 +36,7 @@ The optional mail/rcpt parameters following the address.
 
 =cut
 
-has protocol   => ( is => 'ro', required => 1, weak_ref => 1 );
+has protocol   => ( is => 'ro', required => 1 );
 has original   => ( is => 'rw' );
 has command    => ( is => 'rw' );
 has host       => ( is => 'rw' );
