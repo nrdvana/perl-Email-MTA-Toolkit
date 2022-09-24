@@ -73,6 +73,21 @@ use Carp;
   
 =cut
 
+has state            => ( is => 'rw', default => '' );
+has io               => ( is => 'rw' );
+has server_domain    => ( is => 'rw' );
+has server_address   => ( is => 'rw' );
+has client_domain    => ( is => 'rw' );
+has client_address   => ( is => 'rw' );
+has mail_transaction => ( is => 'rw', clearer => 1, lazy => 1, default => sub { +{} } );
+has ehlo_keywords    => ( is => 'rw', default => sub { +{} } );
+
+has line_length_limit  => ( is => 'rw', default => 1000 );
+has message_size_limit => ( is => 'rw', default => 10*1024*1024 );
+has recipient_limit    => ( is => 'rw', default => 1024 );
+
+has on_handshake => ( is => 'rw' );
+
 our %COMMANDS;
 
 =head1 RELATED OBJECTS
@@ -169,7 +184,7 @@ attributes.
 =cut
 
 require Email::MTA::Toolkit::SMTP::Response;
-sub _build_request_class { 'Email::MTA::Toolkit::SMTP::Response' }
+sub _build_response_class { 'Email::MTA::Toolkit::SMTP::Response' }
 
 sub response_class {
    my $self= shift;
@@ -211,20 +226,33 @@ command and return a hashref, where errors are reported as C<< $result->{error} 
 =cut
 
 sub parse_cmd_if_complete {
-   my $class= shift;
+   my $self= shift;
    if (@_) {
       # Function operates on $_, not @_, but be nice to callers who try
       # to pass the buffer as an argument.
-      return $class->parse_cmd_if_complete for $_[0];
+      return $self->parse_cmd_if_complete for $_[0];
    }
-   return undef unless /\G((\S*).*?(\r?\n))/gc;
-   my ($line, $cmd, $eol)= ($1, uc $2, $3);
+   return undef unless /\G( (\S*) \  (.*?) (\r?\n) )/gcx;
+   my ($line, $cmd, $args, $eol)= ($1, uc $2, $3, $4);
    my $ret;
-   if (my $m= $class->can("parse_cmd_$cmd")) {
-      $ret= $class->$m for $line;
+   if (ref $self) {
+      my $cmdinfo= $self->commands->{$cmd}
+         or return {
+            error => $self->can("parse_cmd_args_$cmd")
+               ? [ 502, qq{Unimplemented} ]
+               : [ 500, qq{Unknown command "$cmd"} ]
+         };
+      my $m= $cmdinfo->{parse} || $class->can("parse_cmd_args_$cmd");
+      $ret= $self->$m($args) for $args;
    } else {
-      $ret= { error => [ 500, qq{Unknown command "$cmd"} ] };
+      if (my $m= $self->can("parse_cmd_args_$cmd")) {
+         $ret= $self->$m($args) for $args;
+      } else {
+         $ret= { error => [ 500, qq{Unknown command "$cmd"} ] };
+      }
    }
+   $ret->{command}= $cmd;
+   $ret->{original}= $line;
    push @{$ret->{warnings}}, 'Missing CR at end of line'
       unless $eol eq "\r\n";
    return $ret;
@@ -253,7 +281,7 @@ or undef on failure.
 
 sub parse_host_addr {
    # TODO: implement a proper parse that fails on errors
-   /\G (\S+) /gcx? $1 : undef;
+   /\G \[ ([^]]+) \] /gcx? $1 : undef;
 }
 
 =head2 parse_forward_path
@@ -317,26 +345,30 @@ sub parse_mail_parameters {
    } split / /, substr($_, pos) }
 }
 
-sub format_mail_parameters {
+sub render_mail_parameters {
    my ($class, $p)= @_;
    join ' ', map { defined $p->{$_}? "$_=$p->{$_}" : "$_" } keys %$p;
 }
 *parse_rcpt_parameters= *parse_mail_parameters;
-*format_rcpt_parameters= *format_mail_parameters;
+*render_rcpt_parameters= *render_mail_parameters;
 sub parse_mailbox {
    # TODO
    /\G( \S+ \@ \w[-\w]* (?: \. \w[-\w]* )* )/gcx? $1 : undef;
 }
 
-=head2 format_cmd
+=head2 render_cmd
+
+Return the command as a canonical line of text ending with C<"\r\n">.
 
 =cut
 
-sub format_cmd {
+sub render_cmd {
    my ($self, $req)= @_;
-   my $m= $self->can("format_cmd_$req->{command}")
-      or croak "Don't know how to format a $req->{command} message";
-   $m->($self, $req);
+   my $cmd= ref $self && $self->commands->{uc $req->{command}};
+   my $m= ($cmd? $cmd->{render} : undef)
+      || $self->can("render_cmd_$req->{command}")
+      or croak "Don't know how to render a $req->{command} message";
+   $self->$m($req);
 }
 
 =head1 STATES
@@ -402,15 +434,23 @@ The modern session-initiation command.  This is allowed in any state except
 
 =item ehlo
 
-  $request= $smtp->ehlo($domain);
+  $request= $smtp->ehlo($domain); # sets $self->client_domain
+  $request= $smtp->ehlo;          # uses $self->client_domain
 
 Shortcut for calling L</send_command>.
 
-=item parse_cmd_EHLO
+=item render_ehlo_domain
 
-Returns a hash of C<< { command => 'EHLO', host => $host } >>
+  $string= $smtp->render_ehlo_domain($domain, $address);
 
-=item format_cmd_EHLO
+Given an optional domain name and optional IP address, format them into the
+format required by EHLO command, or croak if they are not valid.
+
+=item parse_cmd_args_EHLO
+
+Returns a hash of C<< { domain => $host } >>
+
+=item render_cmd_EHLO
 
 Returns canonical encoding of the ehlo command.
 
@@ -426,38 +466,63 @@ including all the keywords in the L</ehlo_keywords> attribute.
 
 $COMMANDS{EHLO}= {
    states => { handshake => 1, ready => 1, mail => 1, data => 1 },
+   render => 'render_cmd_EHLO',
+   parse  => 'parse_cmd_args_EHLO',
+   handle => 'handle_cmd_EHLO',
 };
 
 sub ehlo {
-   my ($self, $domain, $keywords)= @_;
-   $self->send_command({ command => 'HELO', domain => $domain });
+   my ($self, $domain)= @_;
+   my $ret= $self->send_command({ command => 'EHLO', domain => $domain
+         // $self->render_ehlo_domain($self->client_domain, $self->client_address) });
+   $self->client_domain($domain) if defined $domain;
+   return $ret;
 }
 
-sub format_cmd_EHLO {
-   "EHLO ".$_[1]{host};
+sub render_ehlo_domain {
+   my ($self, $domain, $address)= @_;
+   if (defined $domain) {
+      $self->parse_domain || croak "Invalid domain '$domain'" for $domain;
+      return $domain;
+   } else {
+      defined $address || croak "domain or address must be defined before EHLO";
+      return '['.$address.']';
+   }
 }
 
-sub parse_cmd_EHLO {
+sub render_cmd_EHLO {
+   'EHLO '.$_[0]->render_ehlo_domain($_[1]{domain}, $_[1]{address})
+}
+
+sub parse_cmd_args_EHLO {
    my $self= shift;
-   my $host;
-   /\GEHLO /gci
-   && defined($host= ($self->parse_host_addr // $self->parse_domain))
-   && /\G *(?=\r?\n)/gc
-      or return { error => "500 Invalid EHLO syntax" };
-   return { command => 'EHLO', host => $host }
+   my ($domain, $addr);
+   if (/\G(?=\[)/gc) {
+      $addr= $self->parse_host_addr;
+   } else {
+      $domain= $self->parse_domain;
+   }
+   defined $addr || defined $domain
+      or return { error => [ 501, 'invalid EHLO domain' ] };
+   /\G *$/gc
+      or return { error => [ 501, 'unexpected extra arguments' ] };
+   return {
+      helo => 
+      defined $domain? ( domain => $domain ) : ( address => $addr ),
+   }
 }
 
 sub handle_cmd_EHLO {
    my ($self, $command)= @_;
-   $self->client_domain($command->{domain});
-   $self->clear_transaction();
-   if ($self->on_handshake) {
+   $self->client_helo($command->{domain}) if defined $command->{domain}
+   $self->clear_mail_transaction;
+   if ($self->listeners->{handshake}) {
       $self->on_handshake->($self, $command);
    }
-   my @ret= ( 250, $self->server_domain );
+   my @ret= ( 250, $self->render_ehlo_domain($self->server_domain, $self->server_address) );
    for (sort keys %{ $self->ehlo_keywords }) {
       my ($k, $v)= ($_, $self->ehlo_keywords->{$_});
-      push @keywords, join ' ', $_,
+      push @ret, join ' ', $_,
          ref $v eq 'ARRAY'? @$v
          : defined $v && length $v? ($v)
          : ();
@@ -478,13 +543,13 @@ but all clients should use EHLO.
 
 Shortcut for calling L</send_command>.
 
-=item format_cmd_HELO
+=item render_cmd_HELO
 
 Returns the canonical HELO string (without CRLF) from a hashref.
 
-=item parse_cmd_HELO
+=item parse_cmd_args_HELO
 
-Returns a hash of C<< { command => 'HELO', host => $host } >>
+Returns a hash of C<< { domain => $host } >>
 
 =item handle_cmd_HELO
 
@@ -498,6 +563,9 @@ C<on_handshake> callback (if set).  Then it returns a 250 reply.
 
 $COMMANDS{HELO}= {
    states => { handshake => 1, ready => 1, mail => 1, data => 1 },
+   render => 'render_cmd_HELO',
+   parse  => 'parse_cmd_args_HELO',
+   handle => 'handle_cmd_HELO',
 };
 
 sub helo {
@@ -505,18 +573,17 @@ sub helo {
    $self->send_command({ command => 'HELO', domain => $domain });
 }
 
-sub format_cmd_HELO {
+sub render_cmd_HELO {
    "HELO ".$_[1]{host};
 }
 
-sub parse_cmd_HELO {
+sub parse_cmd_args_HELO {
    my $self= shift;
-   my $host;
-   /\GHELO /gci
-   && defined($host= $self->parse_domain)
-   && /\G *(?=\r?\n)/gc
-      or return { error => "500 Invalid HELO syntax" };
-   return { command => 'HELO', host => $host }
+   my $domain= $self->parse_domain
+      // return { error => [ 501, 'invalid HELO domain' ] };
+   /\G *$/gc
+      or return { error => [ 501, 'unexpected extra arguments' ] };
+   return { domain => $domain }
 }
 
 sub handle_cmd_HELO {
@@ -524,10 +591,8 @@ sub handle_cmd_HELO {
    $self->client_domain($command->{domain});
    $self->ehlo_keywords({});
    $self->clear_transaction();
-   if ($self->on_handshake) {
-      $self->on_handshake->($self, $command);
-   }
-   return [ 250, $self->server_domain ];
+   my $ret= $self->call_event('handshake', $command);
+   return $ret // [ 250, $self->get_helo_domain ];
 }
 
 =head2 MAIL
@@ -547,7 +612,7 @@ Declare the envelope sender of the message.
 
 Shortcut for calling L</send_command>.
 
-=item format_cmd_MAIL
+=item render_cmd_MAIL
 
 Returns the canonical MAIL command string (without CRLF) from a hashref.
 
@@ -588,12 +653,12 @@ sub parse_cmd_MAIL {
    return { command => 'MAIL', path => $path, parameters => $params }
 }
 
-sub format_cmd_MAIL {
+sub render_cmd_MAIL {
    my $self= shift;
    my ($path,$params)= @{$_[0]}{'path','parameters'};
    $path= join ',', @$path if ref $path eq 'ARRAY';
    !$params || !keys %$params? "MAIL FROM:<$path>"
-      : "MAIL FROM:<$path> ".$self->format_mail_parameters($params)
+      : "MAIL FROM:<$path> ".$self->render_mail_parameters($params)
 }
 
 sub handle_cmd_MAIL {
@@ -624,7 +689,7 @@ Declare another recipient for the current message.
 
 Shortcut for calling L</send_command>.
 
-=item format_cmd_RCPT
+=item render_cmd_RCPT
 
 Returns the canonical RCPT command string (without CRLF) from a hashref.
 
@@ -662,12 +727,12 @@ sub parse_cmd_RCPT {
    return { command => 'RCPT', path => $path, parameters => $params }
 }
 
-sub format_cmd_RCPT {
+sub render_cmd_RCPT {
    my $self= shift;
    my ($path, $params)= @{$_[0]}{'path','parameters'};
    $path= join ',', @$path if ref $path eq 'ARRAY';
    !$params || !keys %$params? "RCPT TO:<$path>"
-      : "RCPT TO:<$path> ".$self->format_rcpt_parameters($params)
+      : "RCPT TO:<$path> ".$self->render_rcpt_parameters($params)
 }
 
 sub handle_cmd_RCPT {
@@ -724,7 +789,7 @@ All strings should be 7-bit ascii, unless an 8-bit extension was negotiated.
 Call this after the last L</more_data>, to indicate the end of the data and
 allow the terminating line to be sent.
 
-=item format_cmd_DATA
+=item render_cmd_DATA
 
 Always returns "DATA\r\n"
 
@@ -819,7 +884,7 @@ sub end_data {
    $self->mail_transaction->{data_complete}= 1;
 }
 
-sub format_cmd_DATA {
+sub render_cmd_DATA {
    "DATA\r\n";
 }
 
@@ -831,9 +896,10 @@ sub parse_cmd_DATA {
 
 sub handle_cmd_DATA {
    my $self= shift;
-   my $ret= !@{$self->mail_transaction->{recipients}}? [ ... ]
-      : [ ... ]
-   ...
+   @{$self->mail_transaction->{recipients}}
+      or return [ 503, 'Require RCPT before DATA' ];
+   $self->state('data');
+   return [ 354, 'Start mail input; end with <CRLF>.<CRLF>' ]
 }
 
 =head2 QUIT
@@ -842,7 +908,7 @@ sub handle_cmd_DATA {
 
 =item parse_cmd_QUIT
 
-=item format_cmd_QUIT
+=item render_cmd_QUIT
 
 =back
 
@@ -853,7 +919,7 @@ sub parse_cmd_QUIT {
       or return { error => "500 Invalid QUIT syntax" };
    return { command => 'QUIT' }
 }
-sub format_cmd_QUIT {
+sub render_cmd_QUIT {
    "QUIT";
 }
 

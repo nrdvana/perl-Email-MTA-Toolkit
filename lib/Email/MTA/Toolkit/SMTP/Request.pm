@@ -1,7 +1,7 @@
 package Email::MTA::Toolkit::SMTP::Request;
 use Moo;
 use Carp;
-use overload '""' => \&format;
+use overload '""' => \&render;
 
 =head1 CONSTRUCTORS
 
@@ -53,9 +53,9 @@ Return the command as a string of SMTP protocol, not including the CRLF terminat
 
 =cut
 
-sub format {
+sub render {
    my $self= shift;
-   $self->protocol->format_cmd($self)
+   $self->protocol->render_cmd($self)
 }
 
 sub TO_JSON {

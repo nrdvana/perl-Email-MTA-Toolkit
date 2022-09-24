@@ -16,7 +16,7 @@ for (@tests) {
    my ($orig, $canonical)= @$_;
    my $req= $smtp->parse_cmd_if_complete($orig."\r\n");
    if ($req && $req->{command}) {
-      is_deeply( $smtp->format_cmd($req), $canonical, $orig );
+      is_deeply( $smtp->render_cmd($req), "$canonical\r\n", $orig );
    } else {
       diag explain $req;
       fail( $orig );
