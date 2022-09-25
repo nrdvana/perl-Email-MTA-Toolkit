@@ -1,0 +1,4 @@
+openssl req -x509 -sha256 -days 3650 -nodes -newkey rsa:2048 -subj "/CN=localhost/C=US/L=test" -keyout CA.key -out CA.pem
+openssl genrsa -out cert.key
+openssl req -new -key cert.key -out cert.csr -config csr.conf 
+openssl x509 -req -in cert.csr -CA CA.pem -CAkey CA.key -CAcreateserial -out cert.pem -days 3650 -sha256 -extfile cert.conf 
