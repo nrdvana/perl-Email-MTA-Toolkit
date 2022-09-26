@@ -1,10 +1,11 @@
 package Email::MTA::Toolkit::IO;
+use strict;
+use warnings;
 use Carp;
 
 =head1 DESCRIPTION
 
-IO objects help isolate algorithm input/output from the underlying transport,
-including SSL details.
+IO objects help isolate algorithm input/output from the underlying transport.
 
 For the code consuming input and generating output, the read-buffer L</rbuf>
 contains a string of bytes which have already been received, and the L</wbuf>
@@ -17,13 +18,19 @@ be implemented in a blocking or non-blocking or event-driven manner.  C<fill>
 should return the number of bytes that were added to C<rbuf> immediately.
 Code that needs additional bytes should return gracefully if it can't get
 enough bytes from one call to C<fill>, leaving the algorithm on hold, to be
-resumed later.  C<Fill> may also remove the portions of the buffer before
+resumed later.  C<fill> may also remove the portions of the buffer before
 C<< pos($io->{rbuf}) >> in order to avoid enlarging the C<rbuf> beyond
 C<rbuf_limit>.
 
 Likewise, C<flush> should return the number of bytes written, and remove them
 from the start of the C<wbuf> (or advance pos($io->{wbuf}) if it makes more
 sense to do that for some reason).
+
+The default implementation of fill() and flush() read from C<src> and write to
+C<dst>.  Those attributes can be undefined (no action), a file handle (blocking
+or nonblocking read/write), or coderefs (which receive the IO object as the
+only parameter, and can take any action desired).  You can also make a subclass
+with your own implementation of fill() and flush().
 
 =head1 ATTRIBUTES
 
@@ -62,25 +69,23 @@ Shorthand for C<< length($io->{wbuf}) - pos($io->{wbuf}) >>
 =head2 src
 
 A file handle (for blocking or nonblocking reads) or a coderef (for callbacks)
-which new bytes will come from when L</fill> is requested.
+which will be used when L</fill> is requested.
 
 =head2 dst
 
 A file handle (for blocking or nonblocking writes) or a coderef (for callbacks)
-which wbuf bytes will be written to when L</flush> is requested.
+which will be used when L</flush> is requested.
 
 =cut
 
 sub rbuf       :lvalue { croak "rbuf is an lvalue" if @_ > 1; $_[0]{rbuf} }
 sub rbuf_pos   :lvalue { croak "rbuf_pos is an lvalue" if @_ > 1; pos $_[0]{rbuf} }
-sub rbuf_avail         { length $_[0]{rbuf} - pos $_[0]{rbuf} }
+sub rbuf_avail         { length($_[0]{rbuf}) - (pos($_[0]{rbuf}) || 0) }
 sub eof                { $_[0]{eof}= $_[1] if @_ > 1; $_[0]{eof} }
 sub wbuf       :lvalue { croak "wbuf is an lvalue" if @_ > 1; $_[0]{wbuf} }
-sub wbuf_pos   :lvalue { croak "wbuf_pos is an lvalue" if @_ > 1; pos $_[0]{wbuf} }
-sub wbuf_avail         { length $_[0]{wbuf} - pos $_[0]{wbuf} }
 
-sub src                { croak "src is read only" if @_ > 1; $_[0]{src} }
-sub dst                { croak "dst is read only" if @_ > 1; $_[1]{dst} }
+sub src                { $_[0]{src}= $_[1] if @_ > 1; $_[0]{src} }
+sub dst                { $_[0]{dst}= $_[1] if @_ > 1; $_[0]{dst} }
 
 sub new {
 	my $class= shift;
@@ -100,14 +105,19 @@ sub fill {
 	my $src= $self->src;
 	if (!defined $src) {
 		return 0;
-	} elsif (ref($src)->can('sysread')) {
-		if (pos($self->{rbuf}) > (length($self->{rbuf}) >> 1)) {
-			substr($self->{rbuf}, 0, pos($self->{rbuf}))= '';
+	} elsif (ref($src) eq 'GLOB' or ref($src)->can('read')) {
+		my $p= pos $self->{rbuf};
+		if ($p > (length($self->{rbuf}) >> 1)) {
+			substr($self->{rbuf}, 0, $p)= '';
+			$p= 0;
 		}
-		my $got= $src->sysread($self->{rbuf}, 4096, length $self->{rbuf});
-		return $got if $got > 0;
-		die "sysread: $!" if $got < 0 && !($!{INTR} || $!{AGAIN} || $!{WOULDBLOCK});
-		$self->eof(1) if $got == 0;
+		my $got= $src->sysread($self->{rbuf}, 65536, length $self->{rbuf});
+		if (defined $got) {
+			pos($self->{rbuf})= $p;
+			$self->eof(1) if $got == 0;
+			return $got;
+		}
+		die "read: $!" unless $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
 		return 0;
 	} else {
 		return $self->src->($self);
@@ -117,51 +127,19 @@ sub fill {
 sub flush {
 	my $self= shift;
 	my $dst= $self->dst;
-	if (!defined $dst || !$self->wbuf_avail) {
+	if (!defined($dst) or !length($self->{wbuf})) {
 		return 0;
-	} elsif (ref($dst)->can('syswrite')) {
-		my $put= $dst->syswrite($self->{wbuf}, $self->wbuf_avail, pos $self->{wbuf});
-		if ($put >= 0) {
-			pos($self->{wbuf}) += $put;
-			substr($self->{wbuf}, 0, pos $self->{wbuf})= ''
-				if pos $self->{wbuf} >= (length($self->{wbuf}) >> 1);
+	} elsif (ref($dst) eq 'GLOB' or ref($dst)->can('write')) {
+		my $put= $dst->syswrite($self->{wbuf});
+		if (defined $put) {
+			substr($self->{wbuf}, 0, $put)= '';
 			return $put;
 		}
-		die "syswrite: $!" if $put < 0 && !($!{INTR} || $!{AGAIN} || $!{WOULDBLOCK});
+		die "write: $!" if $put < 0 && !($!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK});
 		return 0;
 	} else {
 		return $self->dst->($self);
 	}
 }
-
-package Email::MTA::Toolkit::IO::SSL;
-our @ISA= qw( Email::MTA::Toolkit::IO );
-use strict;
-use warnings;
-use SSLeay;
-
-sub new {
-	my $class= shift;
-	my $self= $class->next::method(@_);
-	_init_ssleay;
-	
-	$self;
-}
-
-sub new_client {
-	my $class= shift;
-	my $self= $class->new(@_);
-	$self;
-}
-
-sub new_server {
-	my $class= shift;
-	my $self= $class->new(@_);
-	$self;
-}
-
-sub fill {  }
-
-sub flush {  }
 
 1;
