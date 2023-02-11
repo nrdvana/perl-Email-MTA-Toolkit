@@ -1,7 +1,8 @@
 package Email::MTA::Toolkit::SSL;
 use Exporter::Extensible -exporter_setup => 1;
-use Net::SSLeay;
-use Carp;
+use Net::SSLeay ();
+use Scalar::Util ();
+use Carp ();
 
 # SSLeay code taken from great example at
 # http://devpit.org/wiki/OpenSSL_with_nonblocking_sockets_%28in_Perl%29
@@ -28,8 +29,28 @@ sub ssl_get_error :Export(:util) {
 sub ssl_croak_if_error :Export(:util) {
    my ($message)= @_;
    my $err= ssl_get_error();
-   croak "$message: $err" if length $err;
+   Carp::croak("$message: $err") if length $err;
    return;
+}
+
+sub new_ssl_context :Export(:ctors) {
+   require Email::MTA::Toolkit::SSL::Context;
+   Email::MTA::Toolkit::SSL::Context->new(@_);
+}
+
+sub new_ssl_server :Export(:ctors) {
+   require Email::MTA::Toolkit::SSL::Session;
+   Email::MTA::Toolkit::SSL::Session->new_server(@_);
+}
+
+sub new_ssl_client :Export(:ctors) {
+   require Email::MTA::Toolkit::SSL::Session;
+   Email::MTA::Toolkit::SSL::Session->new_client(@_);
+}
+
+sub new_mem_bio :Export(:ctors) {
+   require Email::MTA::Toolkit::SSL::BIO;
+   Email::MTA::Toolkit::SSL::BIO->new(@_);
 }
 
 1;

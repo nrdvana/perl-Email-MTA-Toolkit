@@ -16,30 +16,46 @@ Each context can represent only one server certificate.
 
 sub new {
    my $class= shift;
+   my %opts= @_ == 1 && ref $_[0] eq 'HASH'? %{$_[0]} : @_;
+
    my $ctx= Net::SSLeay::CTX_new;
    ssl_croak_if_error("SSL CTX_new");
-   bless \$ctx, $class;
-}
 
-sub DESTROY {
-   Net::SSLeay::CTX_free(${$_[0]});
-}
+   my $self= bless \$ctx, $class;
 
-sub new_server_context {
-   my ($class, %opts)= @_;
-   my $self= $class->new;
+   if (!$opts{private_key_file} and $opts{key}) {
+      # 'key' is less specific and might be confused for supplying raw PEM data
+      if ($opts{key} =~ /^---+ *BEGIN/i) {
+         Carp::croak("provided 'key' is PEM content, not a filename.  (it would be nice to support that, patches welcome)");
+      } else {
+         $opts{private_key_file}= delete $opts{key};
+      }
+   }
+   if (!$opts{certificate_file} and $opts{cert}) {
+      # 'cert' is less specific and might be confused for supplying raw PEM data
+      if ($opts{cert} =~ /^---+ *BEGIN/i) {
+         Carp::croak("provided 'cert' is PEM content, not a filename.  (it would be nice to support that, patches welcome)");
+      } else {
+         $opts{certificate_file}= delete $opts{cert};
+      }
+   }
+
    # OP_ALL enables all harmless work-arounds for buggy clients.
-   $self->set_options(Net::SSLeay::OP_ALL());
+   $self->set_options(defined $opts{options}? $opts{options} : Net::SSLeay::OP_ALL());
    # Modes:
    # 0x1: SSL_MODE_ENABLE_PARTIAL_WRITE
    # 0x2: SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
    # 0x4: SSL_MODE_AUTO_RETRY
    # 0x8: SSL_MODE_NO_AUTO_CHAIN
    # 0x10: SSL_MODE_RELEASE_BUFFERS (ignored before OpenSSL v1.0.0)
-   $self->set_mode(0x11);
+   $self->set_mode(defined $opts{mode}? $opts{mode} : 0x11);
    $self->set_private_key_file($opts{private_key_file}) if $opts{private_key_file};
    $self->set_certificate_file($opts{certificate_file}) if $opts{certificate_file};
-   return $self;
+   $self;
+}
+
+sub DESTROY {
+   Net::SSLeay::CTX_free($_[0]->pointer);
 }
 
 sub pointer { ${$_[0]} }
@@ -74,6 +90,5 @@ sub set_certificate_file {
    ssl_croak_if_error("SSL CTX_use_certificate_file");
    return $self;
 }
-
 
 1;
