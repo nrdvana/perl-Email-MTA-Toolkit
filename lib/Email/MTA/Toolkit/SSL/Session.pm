@@ -46,6 +46,7 @@ sub new {
    Scalar::Util::weaken($ssl_pointer_map{$self->pointer}= $self);
    $self->set_fd($attrs{fd}) if defined $attrs{fd};
    $self->set_bio($attrs{bio}) if defined $attrs{bio};
+   $self->mode(delete $attrs{mode}) if defined $attrs{mode};
    Net::SSLeay::set_info_callback($self->pointer, \&_info_callback);
    $self;
 }
@@ -102,7 +103,16 @@ sub context { $_[0]{context} }
 sub pointer { $_[0]{pointer} }
 
 sub state {
-   Net::SSLeay::state($_[0]{pointer});
+   Scalar::Util::dualvar(
+      Net::SSLeay::state($_[0]{pointer}),
+      Net::SSLeay::state_string_long($_[0]{pointer})
+   );
+}
+sub state_string {
+   Net::SSLeay::state_string($_[0]{pointer});
+}
+sub state_string_long {
+   Net::SSLeay::state_string_long($_[0]{pointer});
 }
 
 sub certificate {
@@ -179,10 +189,6 @@ sub set_bio {
    Net::SSLeay::set_bio($_[0]{pointer}, $_[1], $_[2]);
 }
 
-sub state_string_long {
-   Net::SSLeay::state_string_long($_[0]{pointer});
-}
-
 sub get_last_error {
    my $last_ret= defined $_[0]{last_error_return}? delete $_[0]{last_error_return} : -1;
    my $err= Net::SSLeay::get_error($_[0]{pointer}, $last_ret);
@@ -191,6 +197,14 @@ sub get_last_error {
 
 sub do_handshake {
    $_[0]{last_error_return}= Net::SSLeay::do_handshake($_[0]{pointer});
+}
+
+sub connect {
+   $_[0]{last_error_return}= Net::SSLeay::connect($_[0]{pointer});
+}
+
+sub accept {
+   $_[0]{last_error_return}= Net::SSLeay::accept($_[0]{pointer});
 }
 
 sub read {
