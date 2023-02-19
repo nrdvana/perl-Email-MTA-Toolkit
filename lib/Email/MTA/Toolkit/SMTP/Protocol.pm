@@ -3,83 +3,76 @@ use v5.36;
 use Moo;
 use Carp;
 use Email::MTA::Toolkit::SMTP::EnvelopeRoute;
+use Email::MTA::Toolkit::IO;
 use namespace::clean;
 
-=head1 SYNOPSIS
+=head1 DESCRIPTION
 
-  my $server= Email::MTA::Toolkit::SMTP->new_server;
-  my $client= Email::MTA::Toolkit::SMTP->new_client;
-  
-  # This module doesn't even require a socket!
-  # It can talk SMTP and SSL right inside of byte buffers.
-  # This leaves you free to use any I/O engine.
-  sub do_io {
-    $client->io->{rbuf} .= $server->io->{wbuf};
-    $server->io->{wbuf}= '';
-    $client->process;
-    $server->io->{rbuf} .= $client->io->{wbuf};
-    $client->io->{wbuf}= '';
-    $server->process;
-  }
-  
-  # Highest level API, whole mail transactions
-  
-  $server->on_transaction(sub ($self, $mail_txn, $data_cmd) {
-    use Data::Printer;
-    p $mail_msg;
-    $self->respond(
-  });
-  my $res= $client->send_message({
-    to => ...,      # envelope
-    from => ...,    # envelope
-    data => $email, # MIME encoded string or Email::MIME 
-  });
-  do_io while $res->is_pending;
-  $res->assert_ok;
-  
-  # Medium level API, SMTP commands
-  
-  $server->on_request(sub ($self, $req) {
-    my $res= $self->dispatch_request($req);
-    if ($req->command eq 'AUTH') {
-      $self->data_size_limit(512*1024*1024) if $res->is_success;
-    }
-    return $res;
-  });
+This class acts as a base class for ::SMTP::Server and ::SMTP::Client.  If you look at the
+SMTP protocol as a series of commands that conveys client state to a server, the attributes of
+this class are the ones that the client wants to write and the server wants to read and have
+available for decision making.
 
-  my $res= $client->helo;
-  do_io while $res->pending;
-  $res->assert_ok;
-  $res= $client->mail_from($envelope_sender);
-  do_io while $res->pending;
-  $res->assert_ok;
-  $res= $client->rcpt_to($envelope_recipient);
-  do_io while $response->pending;
-  $res->assert_ok;
-  $res= $client->data($email->as_string);
-  do_io while $response->pending;
-  $res->assert_ok;
-  
-  # Low level API, SMTP with manual dispatch
-  
-  $client->request('HELO client.example.com');
-  $server->io->{rbuf} .= $client->io->{wbuf};
-  $client->io->{wbuf}= '';
-  my $req= $server->parse_request;
-  if ($req->command eq 'HELO') {
-    $server->respond(250, 'server.example.com Hello client.example.com');
-  }
-  else {
-    $server->dispatch_request($req);
-  }
-  $client->io->{rbuf} .= $server->io->{wbuf};
-  $server->io->{wbuf}= '';
-  my $res= $client->parse_response;
-  
+For instance, when the client sends EHLO with a domain name, and the server responds to that
+command with its own hostname, and list of "keywords" (supported extensions) the client and
+server should now have matching values for the L</client_helo>, L</server_helo>, and
+L</server_ehlo_keywords> attributes.
+
+Any attribute unrelated to the shared state of the SMTP session live in the respective
+::Client or ::Server subclass.
+
+This class also contains all methods related to parsing and formatting commands and responses.
+
+=head1 ATTRIBUTES
+
+=head2 state
+
+The state of the current session.  One of C<''>, C<'handshake'>, C<'reject'>,
+C<'ready'>, C<'mail'>, C<'data'>, C<'quit'>.  See L</STATES> for details.
+
+=head2 io
+
+An object implementating both L<Email::MTA::Toolkit::IO::IBuf> and
+L<Email::MTA::Toolkit::IO::OBuf>.
+
+=head2 server_domain
+
+DNS name of the server.  This should be populated before the protocol begins.
+
+=head2 server_address
+
+IP Address of the server.  This should be populated before the protocol begins.
+
+=head2 server_helo
+
+Name reported by the server to the client during HELO or EHLO commands.
+
+=head2 server_ehlo_keywords
+
+A hashref of options the server reports to the client during the response to EHLO command.
+
+=head2 client_domain
+
+The DNS name of the client.  This should be populated before the protocol begins.
+
+=head2 client_address
+
+The IP address of the client.  This should be populated before the protocol begins.
+
+=head2 client_helo
+
+Name reported by the client to the server during HELO or EHLO commands.
+
+=head2 mail_transaction
+
+An instance of L<Email::MTA::Toolkit::SMTP::Transaction>, which should be created using
+L</new_transaction> in response to the "MAIL" command.
+
 =cut
 
-has state                => ( is => 'rw', default => '' );
-has io                   => ( is => 'rw' );
+has state                => ( is => 'rw', default => 'connect' );
+has io                   => ( is => 'rw', coerce => \&Email::MTA::Toolkit::IO::coerce_io );
+has greeting             => ( is => 'rw', lazy => 1, builder => 1 );
 has server_domain        => ( is => 'rw' );
 has server_address       => ( is => 'rw' );
 has server_helo          => ( is => 'rw' );
@@ -87,15 +80,31 @@ has server_ehlo_keywords => ( is => 'rw' );
 has client_domain        => ( is => 'rw' );
 has client_address       => ( is => 'rw' );
 has client_helo          => ( is => 'rw' );
-has mail_transaction     => ( is => 'rw' );
+has mail_transaction     => ( is => 'rw', clearer => 1 );
+
+sub _build_greeting {
+   my $self= shift;
+   "Email::MTA::Toolkit server"
+      .($self->server_domain? " on ".$self->server_domain : '')
+}
+
+=head2 last_parse_error
+
+The most recent error from one of the parse routines.  This may be a simple string,
+or an arrayref where the first element is the SMTP error code.
+
+=cut
 
 has last_parse_error     => ( is => 'rw' );
 
+# conveinence function for setting the error and returning undef
 sub _undef_with_err($self, $err) {
    $self->last_parse_error($err);
    undef;
 }
 
+# convenience function for prefixing the error with a new string and/or SMTP code
+# and returning undef.
 sub _undef_prefix_err($self, $err) {
    my $prev= $self->last_parse_error;
    $self->last_parse_error($err);
@@ -107,11 +116,38 @@ sub _undef_prefix_err($self, $err) {
    undef;
 }
 
+=head2 line_length_limit
+
+Configurable limit on command length / data line length.
+
+=head2 message_size_limit
+
+Configurable limit on maximum DATA size before aborting and returning an error.
+
+=head2 recipient_limit
+
+Configurable limit on number of recipient mailboxes for one mail transaction.
+
+=cut
+
 has line_length_limit    => ( is => 'rw', default => 1000 );
 has message_size_limit   => ( is => 'rw', default => 10*1024*1024 );
 has recipient_limit      => ( is => 'rw', default => 1024 );
 
-our %COMMANDS;
+=head2 commands
+
+Hashref of available SMTP commands.  This can be modified to remove or add
+commands available to a client.  It deefaults to all the commands defined in
+this module.
+
+=cut
+
+our %commands;
+
+has commands => ( is => 'lazy' );
+sub _build_commands {
+   return { %commands };
+}
 
 =head1 RELATED OBJECTS
 
@@ -170,119 +206,15 @@ sub new_transaction {
    );
 }
 
-=head2 L<Email::MTA::Toolkit::SMTP::Request|Request>
-
-This object wraps a single command sent from client to server.
-
-=over
-
-=item request_class
-
-The name of the class to create for Requests.
-
-=item new_request
-
-  ->new_request( \%attributes );
-  ->new_request( %attributes );
-  ->new_request( $protocol_line );
-
-This is a convenient way to create Request objects.  When given %attributes,
-it is just a short-hand for C<< $smtp->request_class->new(...) >>.  When given
-a C<$protocol_line> it first parses the line (dying if the parse fails) and
-then uses the attributes from the parse.  Unlike the parse methods, this does
-not modify the caller's buffer.
-
-=back
-
-=cut
-
-sub _build_request_class { 'Email::MTA::Toolkit::SMTP::Request' }
-
-sub request_class {
-   my $self= shift;
-   my $field= \$self->{request_class};
-   if (@_ or !defined $$field) {
-      my $class= @_? shift : $self->_build_request_class;
-      Module::Runtime::require_module($class)
-         unless $class->can('new');
-      $$field= $class;
-   }
-   return $$field;
-}
-
-sub new_request {
-   my $self= shift;
-   my @attrs= @_ == 1 && ref $_[0] eq 'HASH'? %{$_[0]}
-      # Convenience helper: passing a single string means to parse that string.
-      : @_ == 1 && !ref $_[0]? do {
-         my $line= shift;
-         $line .= "\n" unless $line =~ /\n\Z/;
-         my $req= $self->parse_cmd_if_complete($line)
-            or croak "Failed to parse command: ".$self->last_parse_error->[1];
-         %$req;
-      }
-      : @_;
-   $self->request_class->new(@attrs, protocol => $self);
-}
-
-=head2 Response
-
-This object wraps a reply sent from server to client.
-See L<Email::MTA::Toolkit::SMTP::Response>.
-
-=over
-
-=item response_class
-
-The name of the class to use for wrapping Responses.
-
-=item new_response
-
-  ->new_response( \%attributes );
-  ->new_response( %attributes );
-  ->new_response( $code, @messages );
-
-This is a convenient way to create Response objects.  When given %attributes,
-it is just a short-hand for C<< $smtp->response_class->new(...) >>.  When given
-a C<$code> and C<@messages>, these are used as the C<code> and C<messages>
-attributes.
-
-=back
-
-=cut
-
-sub _build_response_class { 'Email::MTA::Toolkit::SMTP::Response' }
-
-sub response_class {
-   my $self= shift;
-   my $field= \$self->{response_class};
-   if (@_ or !defined $$field) {
-      my $class= @_? shift : $self->_build_response_class;
-      Module::Runtime::require_module($class)
-         unless $class->can('new');
-      $$field= $class;
-   }
-   return $$field;
-}
-
-sub new_response {
-   my $self= shift;
-   my @attrs= @_ == 1 && ref $_[0] eq 'HASH'? %{$_[0]}
-      : @_ > 0 && length($_[0]) == 3 && $_[0] =~ /^[0-9]{3}$/
-         ? ( code => $_[0], messages => [ @_[1..$#_] ] )
-      : @_;
-   $self->response_class->new(@attrs, protocol => $self);
-}
-
 =head1 STATES
 
 The SMTP protocol has a 'state' attribute, with the following possible values:
 
 =over
 
-=item C<''>
+=item C<'connect'>
 
-The empty initial state means nothing has happened yet.  It can transition to
+The initial state means nothing has happened yet.  It can transition to
 'handshake' or 'reject'.
 L<https://datatracker.ietf.org/doc/html/rfc5321#section-3.1>
 
@@ -324,18 +256,13 @@ transitions back to 'ready' (for a new transaction).
 After the client sends a 'QUIT' command and the server receives it, the state
 transitions to 'QUIT' and all further commands are rejected.
 
+=item C<'abort'>
+
+An unrecoverable protocol error has occurred, and the connection needs to be closed.
+
 =back
 
 =head1 COMMANDS
-
-=cut
-
-our %commands;
-
-has commands => ( is => 'lazy' );
-sub _build_commands {
-   return { %commands };
-}
 
 =head2 EHLO
 
@@ -468,7 +395,7 @@ This command closes the connection gracefully.
 =cut
 
 $commands{QUIT}= {
-   states     => { },
+   states     => { handshake => 1, reject => 1, ready => 1, mail => 1 },
    attributes => {},
    parse      => sub($self) {
       /^QUIT *$/gci
@@ -487,11 +414,11 @@ buffer without modifying it.
 
 On error, the methods return undef and set L</last_parse_error>.
 
-=head2 parse_cmd_if_complete
+=head2 parse_command_if_complete
 
-  for ($buffer) { my $out= $class->parse_cmd_if_complete }
+  for ($buffer) { my $attrs= $class->parse_cmd_if_complete }
   # or
-  my $out= $class->parse_cmd_if_complete($buffer);
+  my $attrs= $class->parse_cmd_if_complete($buffer);
 
 If the buffer C<$_> from C<pos> does not contain a '\n' character, assume the
 command is incomplete and return C<undef> instead of an error.  Else parse the
@@ -499,11 +426,11 @@ command and return a hashref, where errors are reported as C<< $result->{error} 
 
 =cut
 
-sub parse_cmd_if_complete {
+sub parse_command_if_complete {
    if (@_ > 1) {
       # Function operates on $_, not @_, but be nice to callers who try
       # to pass the buffer as an argument.
-      return $_[0]->parse_cmd_if_complete for $_[1];
+      return $_[0]->parse_command_if_complete for $_[1];
    }
    my $self= $_[0];
    my ($line, $cmd, $eol)= /\G( (\S*) .*?) (\r?\n)/gcx
@@ -519,10 +446,63 @@ sub parse_cmd_if_complete {
    $ret= $cmdinfo->{parse}->($self) for $line;
    defined $ret or return undef;
    $ret->{command}= $cmd;
+   $ret->{command_spec}= $cmdinfo;
    $ret->{original}= $line;
    push @{$ret->{warnings}}, 'Missing CR at end of line'
       unless $eol eq "\r\n";
    return $ret;
+}
+
+=head2 parse_response_if_complete
+
+  my $attrs= $class->parse_response_if_complete($buffer);
+
+If the buffer contains a complete response, this returns an array of the code followed by
+one string for each line of the response, with end-of-line truncated.
+
+=cut
+
+has response_parsers => ( is => 'rw', default => sub { +{} } );
+sub parse_response_if_complete {
+   if (@_ > 1) {
+      # Function operates on $_, not @_, but be nice to callers who try
+      # to pass the buffer as an argument.
+      return $_[0]->parse_response_if_complete for $_[1];
+   }
+   my $self= $_[0];
+   my ($first_code, @lines);
+   my ($orig_pos, $line_pos)= (pos($_), pos($_));
+   while (my ($line, $eol)= /\G(.*?) (\r?\n)/gcx) {
+      my ($code, $cont, $body)= ($line =~ /^([0-9]{3}) ([- ]) (.*)$/x)
+         or do {
+            pos($_)= $orig_pos;
+            return _undef_with_err($self, "Malformed response line: '".substr($_, 0, 10)."'");
+         };
+      if (defined $first_code && $first_code != $code) {
+         pos($_)= $line_pos;
+         return _undef_with_err($self, "Malformed response: code $first_code was expected to continue on next line");
+      }
+      push @lines, $body;
+      if ($cont eq ' ') {
+         my $rp= $self->response_parsers->{$code};
+         return $rp? $rp->($code, @lines)
+            : { code => $code, lines => \@lines };
+      }
+      $first_code= $code;
+      $line_pos= pos($_);
+   }
+   # buffer does not contain a complete response
+   return undef;
+}
+
+sub render_response {
+   my ($self, $res)= @_;
+   my $code= $res->{code};
+   my $lines= $res->{lines};
+   my $out= '';
+   $out .= $code . ($_ == $#$lines? ' ' : '-') . $lines->[$_] . "\r\n"
+      for 0..$#$lines;
+   return $out;
 }
 
 =head2 parse_domain
@@ -649,13 +629,15 @@ sets the 'complete' flag to a true value.
 
 =cut
 
-=head2 render_cmd
+# TODO
+
+=head2 render_command
 
 Return the command as a canonical line of text ending with C<"\r\n">.
 
 =cut
 
-sub render_cmd {
+sub render_command {
    my ($self, $req)= @_;
    my $cmdinfo= $self->commands->{uc $req->{command}}
       or croak "Don't know how to render a $req->{command} message";

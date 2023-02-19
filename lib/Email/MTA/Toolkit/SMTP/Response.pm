@@ -1,7 +1,7 @@
 package Email::MTA::Toolkit::SMTP::Response;
 use Moo;
 use Carp;
-use overload '""' => \&render;
+use namespace::clean;
 
 =head1 DESCRIPTION
 
@@ -17,7 +17,7 @@ encoding/decoding those special messages.
 
 =head2 protocol
 
-A reference to an SMTP protocol class or object instance.
+A weak reference to an SMTP protocol class or object instance.
 
 =head2 code
 
@@ -29,9 +29,27 @@ An arrayref of message lines, pre-fomatted (but without CRLF terminators).
 
 =cut
 
+use overload '""' => \&render;
+
 has protocol => ( is => 'rw', required => 1 );
+has request  => ( is => 'rw', accessor => undef );
+has promise  => ( is => 'rw' );
 has code     => ( is => 'rw' );
 has messages => ( is => 'rw' );
+
+# This accessor inflates the request into an object, on demand.
+sub request {
+   my $self= shift;
+   $self->{request}= shift if @_;
+   if ($self->{request} && !blessed($self->{request})) {
+      $self->{request}{protocol}= $self->protocol;
+      $self->{request}{commandinfo} ||= $self->protocol->commands->{$self->{request}{command}};
+      $self->{request}= Email::MTA::Toolkit::SMTP::Request->new($self->{request});
+   }
+   return $self->{request}
+}
+
+sub is_success { $_[0]->code >= 200 && $_[0]->code < 400 }
 
 =head1 METHODS
 
@@ -45,18 +63,6 @@ Convert a mesage to lines of protocol ending with CRLF.
 sub render {
    my $self= shift;
    return $self->protocol->render_response($self);
-}
-
-=head2 TO_JSON
-
-Return the code and message attributes as a hashref.
-
-=cut
-
-sub TO_JSON {
-   my $ret= { %{$_[0]} };
-   delete $ret->{protocol};
-   $ret;
 }
 
 1;
