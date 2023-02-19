@@ -5,6 +5,7 @@ with 'Email::MTA::Toolkit::IO::IBuf', 'Email::MTA::Toolkit::IO::OBuf';
 
 has ihandle => ( is => 'rw', isa => \&_type_readable_handle );
 has ohandle => ( is => 'rw', isa => \&_type_writable_handle );
+has '+ifinal' => ( default => sub { undef; } );
 
 sub BUILD {
    my ($self, $args)= @_;
@@ -37,7 +38,7 @@ sub fetch {
    # else don't, to avoid the memcpy.
    if ($p > (length($$ibuf) >> 1)) {
       substr($$ibuf, 0, $p)= '';
-      $p= 0;
+      pos($$ibuf)= $p= 0;
    }
    my $got= $self->{ihandle}->sysread($$ibuf, $readhint, length $$ibuf);
    if (defined $got) {
@@ -51,14 +52,29 @@ sub fetch {
 }
 
 sub flush {
-   my $self= shift;
-   my $put= $self->{ohandle}->syswrite($self->{obuf});
-   if (defined $put) {
-      substr($self->{obuf}, 0, $put, '');
-      return $put;
+   my ($self, $eof)= @_;
+   if (defined $eof) {
+      $eof eq "EOF" or croak("EOF Argument to flush must be exactly 'EOF'");
+      if (length $self->{obuf}) {
+         $self->{_ofinal_eof_pending}= 1;
+      } else {
+         shutdown($self->{ohandle}, 1); # ignore error because it might not even be a socket
+         $self->{ofinal}= $Email::MTA::Toolkit::IO::IBuf::EOF;
+      }
    }
-   $self->{ofinal}= $!
-      unless $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
+   if (length $self->{obuf}) {
+      my $put= $self->{ohandle}->syswrite($self->{obuf});
+      if (defined $put) {
+         substr($self->{obuf}, 0, $put, '');
+         if (!length $self->{obuf} and delete $self->{_ofinal_eof_pending}) {
+            shutdown($self->{ohandle}, 1); # ignore error because it might not even be a socket
+            $self->{ofinal}= $Email::MTA::Toolkit::IO::IBuf::EOF;
+         }
+         return $put;
+      }
+      $self->{ofinal}= $!
+         unless $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
+   }
    return 0;
 }
 

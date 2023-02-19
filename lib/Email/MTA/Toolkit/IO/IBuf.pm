@@ -79,7 +79,7 @@ sub ibuf_pos :lvalue {
    pos $_[0]{ibuf}
 }
 
-sub ibuf_avail { length $_[0]{ibuf} - pos $_[0]{ibuf} }
+sub ibuf_avail { length($_[0]{ibuf}) - (pos($_[0]{ibuf})||0) }
 
 our $EOF= dualvar(0, 'EOF');
 has ifinal => ( is => 'rw', default => $EOF );

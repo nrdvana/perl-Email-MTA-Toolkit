@@ -26,9 +26,11 @@ written and removed from the buffer across calls to L</flush>.
 
 Error or shutdown status of the stream connected to the buffer.
 
-Shutdown is indicated by C<"0 but true">, and any other value is the system's
-errno of the fatal error.  Transient errors are not reported here, because the
-buffer could still flush in the future.
+Shutdown is indicated by the EOF flag (which is numeric 0 but 'EOF' in string
+context), and any other value is the C<< $! >> of the fatal error (which is also
+a dual number/string).
+
+Transient errors are not reported here, because the buffer could still flush in the future.
 
 =cut
 
@@ -48,11 +50,17 @@ has ofinal => ( is => 'rw' );
 =head2 flush
 
   $io->flush;
+  $io->flush('EOF');
 
 Inticate to other layers that the buffered data should be written to its
 destination.  This has no guarantee that it will immediately affect the L</obuf>.
 Essentially, the code that calls C<flush> is not responsible for reporting errors
 in the transport of the message.
+
+If the writer wants to queue a "shutdown(SHUT_WR)" they can pass the special
+value "EOF" as the only argument.  After the last byte is successfully flushed,
+the implementation should call shutdown on the socket (if it is a socket) and then
+change L</ofinal> to 'EOF'.
 
 =cut
 
