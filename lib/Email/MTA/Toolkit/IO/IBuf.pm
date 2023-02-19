@@ -1,7 +1,8 @@
 package Email::MTA::Toolkit::IO::IBuf;
-use strict;
-use warnings;
-use Scalar::Util ();
+use Moo::Role;
+use Carp;
+use Scalar::Util 'dualvar';
+use namespace::clean;
 
 =head1 DESCRIPTION
 
@@ -62,16 +63,17 @@ will always have the EOF value C<"0 but true">.
 
 =cut
 
+has ibuf => ( is => 'rw', accessor => undef, default => '' );
 sub ibuf :lvalue {
    if (@_ > 1) {
-      Carp::croak("too many arguments") if @_ > 2;
+      croak("too many arguments") if @_ > 2;
       $_[0]{ibuf}= $_[1];
    }
    $_[0]{ibuf}
 }
 sub ibuf_pos :lvalue {
    if (@_ > 1) {
-      Carp::croak("too many arguments") if @_ > 2;
+      croak("too many arguments") if @_ > 2;
       pos($_[0]{ibuf})= $_[1];
    }
    pos $_[0]{ibuf}
@@ -79,8 +81,8 @@ sub ibuf_pos :lvalue {
 
 sub ibuf_avail { length $_[0]{ibuf} - pos $_[0]{ibuf} }
 
-our $EOF= Scalar::Util::dualvar(0, 'EOF');
-sub ifinal { $EOF }
+our $EOF= dualvar(0, 'EOF');
+has ifinal => ( is => 'rw', default => $EOF );
 
 =head1 METHODS
 

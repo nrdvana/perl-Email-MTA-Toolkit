@@ -1,6 +1,7 @@
 package Email::MTA::Toolkit::IO::OBuf;
-use strict;
-use warnings;
+use Moo::Role;
+use Carp;
+use namespace::clean;
 
 =head1 DESCRIPTION
 
@@ -31,15 +32,16 @@ buffer could still flush in the future.
 
 =cut
 
+has obuf => ( is => 'rw', accessor => undef, default => '' );
 sub obuf :lvalue {
    if (@_ > 1) {
-      Carp::croak("too many arguments") if @_ > 2;
+      croak("too many arguments") if @_ > 2;
       $_[0]{obuf}= $_[1];
    }
    $_[0]{obuf}
 }
 
-sub ofinal { $_[0]{ofinal} }
+has ofinal => ( is => 'rw' );
 
 =head1 METHODS
 
@@ -54,6 +56,6 @@ in the transport of the message.
 
 =cut
 
-sub fetch { 0 }
+sub flush { 0 }
 
 1;
