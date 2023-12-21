@@ -137,7 +137,7 @@ has recipient_limit      => ( is => 'rw', default => 1024 );
 =head2 commands
 
 Hashref of available SMTP commands.  This can be modified to remove or add
-commands available to a client.  It deefaults to all the commands defined in
+commands available to a client.  It defaults to all the commands defined in
 this module.
 
 =cut
@@ -179,18 +179,10 @@ L</client_address>, L</client_helo>.
 
 =cut
 
-sub _build_transaction_class { 'Email::MTA::Toolkit::SMTP::Transaction' }
-
-sub transaction_class {
-   my $self= shift;
-   my $field= \$self->{transaction_class};
-   if (@_ or !defined $$field) {
-      my $class= @_? shift : $self->_build_transaction_class;
-      Module::Runtime::require_module($class)
-         unless $class->can('new');
-      $$field= $class;
-   }
-   return $$field;
+has transaction_class => ( is => 'rw', lazy => 1, builder => 1 );
+sub _build_transaction_class {
+   require Email::MTA::Toolkit::SMTP::Transaction;
+   'Email::MTA::Toolkit::SMTP::Transaction'
 }
 
 sub new_transaction {
@@ -253,8 +245,10 @@ transitions back to 'ready' (for a new transaction).
 
 =item C<'quit'>
 
-After the client sends a 'QUIT' command and the server receives it, the state
-transitions to 'QUIT' and all further commands are rejected.
+Any time the server sends a 421 (informing the client that it is shutting down)
+or responds 221 to a client's QUIT command, the state transitions to 'quit' and
+all further commands are rejected.  Also the communication input channel is
+usually shut down, making further commands impossible.
 
 =item C<'abort'>
 
@@ -380,7 +374,7 @@ $commands{DATA}= {
    attributes => { },
    parse      => sub($self) {
       /^DATA *$/gci
-         or return _undef_with_err($self, [500, 'Invalid DATA syntax']);
+         or return _undef_with_err($self, [ 500, 'Invalid DATA syntax' ]);
       return {}
    },
    render     => sub { "DATA" },
@@ -399,7 +393,7 @@ $commands{QUIT}= {
    attributes => {},
    parse      => sub($self) {
       /^QUIT *$/gci
-         or return _undef_with_err($self, [500, 'Invalid QUIT syntax']);
+         or return _undef_with_err($self, [ 500, 'Invalid QUIT syntax' ]);
       return {};
    },
    render     => sub { 'QUIT' },
@@ -486,7 +480,7 @@ sub parse_response_if_complete {
       if ($cont eq ' ') {
          my $rp= $self->response_parsers->{$code};
          return $rp? $rp->($code, @lines)
-            : { code => $code, lines => \@lines };
+            : { code => $code, message_lines => \@lines };
       }
       $first_code= $code;
       $line_pos= pos($_);
@@ -498,7 +492,7 @@ sub parse_response_if_complete {
 sub render_response {
    my ($self, $res)= @_;
    my $code= $res->{code};
-   my $lines= $res->{lines};
+   my $lines= $res->{message_lines};
    my $out= '';
    $out .= $code . ($_ == $#$lines? ' ' : '-') . $lines->[$_] . "\r\n"
       for 0..$#$lines;

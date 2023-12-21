@@ -37,8 +37,10 @@ sub handle_io {
          unshift @err, 500 unless $err[0] =~ /^[0-9]{3}/;
          $self->send_response(@err);
       } else {
-         $self->send_response(503, 'Unexpected EOF, terminating connection');
-         $self->state('abort');
+         if ($self->state ne 'quit') {
+            $self->send_response(503, 'Unexpected EOF, terminating connection');
+            $self->state('abort');
+         }
          return 0;
       }
    }
@@ -54,7 +56,7 @@ sub send_response {
       for 0..$#lines;
    $log->tracef("SMTP Server out: '%s'", _dump_buf(substr($self->io->obuf, $n)))
       if $log->is_trace;
-   $self->io->flush;
+   $self->io->flush($code == 221 || $code == 421? ('EOF') : ());
    return $code;
 }
 
@@ -164,6 +166,18 @@ sub handle_cmd_DATA {
       or return [ 503, 'Require RCPT before DATA' ];
    $self->state('data');
    return [ 354, 'Start mail input; end with <CRLF>.<CRLF>' ]
+}
+
+=item handle_cmd_QUIT
+
+This sends a shutdown request on the IO output handle.
+
+=cut
+
+sub handle_cmd_QUIT {
+   my $self= shift;
+   $self->state('quit');
+   return [ 221, 'Goodbye' ]
 }
 
 =item handle_data

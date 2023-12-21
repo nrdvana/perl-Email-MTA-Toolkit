@@ -1,6 +1,7 @@
 package Email::MTA::Toolkit::SMTP::Response;
 use Moo;
 use Carp;
+use Scalar::Util 'blessed';
 use namespace::clean;
 
 =head1 DESCRIPTION
@@ -23,19 +24,19 @@ A weak reference to an SMTP protocol class or object instance.
 
 The numeric 3-digit code of the response.
 
-=head2 messages
+=head2 message_lines
 
-An arrayref of message lines, pre-fomatted (but without CRLF terminators).
+An arrayref of message lines, without the code prefix or CRLF terminators.
 
 =cut
 
-use overload '""' => \&render;
+use overload '""' => sub { $_[0]->render };
 
-has protocol => ( is => 'rw', required => 1 );
-has request  => ( is => 'rw', accessor => undef );
-has promise  => ( is => 'rw' );
-has code     => ( is => 'rw' );
-has messages => ( is => 'rw' );
+has protocol      => ( is => 'rw', required => 1 );
+has request       => ( is => 'rw', accessor => undef );
+has promise       => ( is => 'rw' );
+has code          => ( is => 'rw' );
+has message_lines => ( is => 'rw' );
 
 # This accessor inflates the request into an object, on demand.
 sub request {
@@ -49,7 +50,10 @@ sub request {
    return $self->{request}
 }
 
-sub is_success { $_[0]->code >= 200 && $_[0]->code < 400 }
+sub is_success {
+   my $code= $_[0]->code;
+   defined $code && $code >= 200 && $code < 400
+}
 
 =head1 METHODS
 

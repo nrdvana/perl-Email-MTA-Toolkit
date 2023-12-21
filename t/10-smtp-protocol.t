@@ -14,8 +14,8 @@ subtest parse_and_render_cmd => sub {
    );
    for (@tests) {
       my ($orig, $expected)= (ref $_? @$_ : ($_,$_));
-      if (ok( my $cmd= $smtp->parse_cmd_if_complete("$orig\r\n"), "parse $orig" )) {
-         is( $smtp->render_cmd($cmd), "$orig\r\n", "render $orig" )
+      if (ok( my $cmd= $smtp->parse_command_if_complete("$orig\r\n"), "parse $orig" )) {
+         is( $smtp->render_command($cmd), "$orig\r\n", "render $orig" )
             or note explain $cmd;
       } else {
          note explain $cmd;

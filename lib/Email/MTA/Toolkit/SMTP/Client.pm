@@ -35,18 +35,18 @@ sub send_command {
    $log->tracef("SMTP Client out: '%s'", _dump_buf(substr($self->io->obuf, $n)))
       if $log->is_trace;
    $self->io->flush;
-   my $res= { request => $req };
-   push $self->_pending_request_queue->@*, $res;
+   my $q_item= { request => $req };
+   push $self->_pending_request_queue->@*, $q_item;
    $self->handle_io;
    # If caller wants to see results of this command, create a Response object for them
    if (defined wantarray) {
-      my $external_res= Email::MTA::Toolkit::SMTP::Response->new(%$res, protocol => $self);
+      my $response_obj= Email::MTA::Toolkit::SMTP::Response->new(%$q_item, protocol => $self);
       # If the response is pending, link the internal record to the external object
       # so that it can be updated on completion.
-      if (!defined $res->{code}) {
-         weaken($res->{external_obj}= $external_res);
+      if (!defined $q_item->{code}) {
+         weaken($q_item->{response_obj}= $response_obj);
       }
-      return $external_res;
+      return $response_obj;
    }
 }
 
@@ -79,15 +79,16 @@ sub handle_io {
          last if !$res && !defined $self->last_parse_error && !$self->io->ifinal;
          # Else we will resolve at least one command
          $forward_progress= 1;
-         my $pending= shift $self->_pending_request_queue->@*;
+         my $q_item= shift $self->_pending_request_queue->@*;
          if ($res) {
-            %$pending= (%$pending, %$res);
+            %$q_item= (%$q_item, %$res);
          } elsif (defined $self->last_parse_error) {
-            $pending->{error}= $self->last_parse_error;
+            $q_item->{error}= $self->last_parse_error;
          } else {
-            $pending->{error}= 'Unexpected end of stream';
+            $q_item->{error}= 'Unexpected end of stream';
          }
-         $self->_handle_response($pending);
+         $self->_update_state_after_response($q_item);
+         $self->_dispatch_response($q_item);
       }
    }
    if ($self->io->ifinal && !$self->io->ibuf_avail) {
@@ -97,38 +98,57 @@ sub handle_io {
    return $forward_progress;
 }
 
-sub _handle_response {
-   my ($self, $res)= @_;
-   use DDP; &p([ response => $res ]);
-   if (!$res->{request}) {
+sub _update_state_after_response {
+   my ($self, $q_item)= @_;
+   my $command= $q_item->{request}? $q_item->{request}{command} : undef;
+   my $code= $q_item->{code};
+   # Any command can result in 421 if the server needs to shut down
+   if ($code == 421) {
+      $self->state('quit');
+   }
+   elsif (!defined $command) {
       # Response to connection (no command sent yet)
-      if ($res->{code} == 220) {
+      if ($code == 220) {
          $self->state('handshake');
-         $self->greeting(join "\n", $res->{lines}->@*);
+         $self->greeting(join "\n", $q_item->{message_lines}->@*);
       }
       else {
          ...
       }
    }
-   elsif ($res->{request}{command} eq 'EHLO' || $res->{request}{command} eq 'HELO') {
-      if ($res->{code} == 250) {
-         $self->server_helo($res->{lines}[0]);
+   elsif ($command eq 'EHLO' || $command eq 'HELO') {
+      if ($code == 250) {
+         $self->server_helo($q_item->{message_lines}[0]);
          $self->state('ready');
       }
       else {
          ...
       }
    }
-   if ($res->{promise}) {
-      if ($res->{error}) {
-         $res->{promise}->reject($res);
+}
+
+sub _dispatch_response {
+   my ($self, $q_item)= @_;
+   # If caller is watching objects we gave them, update those objects
+   if (defined $q_item->{response_obj} || defined $q_item->{promise}) {
+      my $response_obj= delete $q_item->{response_obj};
+      if (defined $response_obj) {
+         $response_obj->code($q_item->{code});
+         $response_obj->message_lines($q_item->{message_lines});
       } else {
-         $res->{promise}->resolve($res);
+         $response_obj= Email::MTA::Toolkit::SMTP::Response->new($q_item);
       }
-   }
-   if ($res->{external_obj}) {
-      $res->{external_obj}{$_}= $res->{$_}
-         for qw( code lines );
+      # in case someone subclasses this, provide access to the same response
+      # object that the promise saw. (now a strong reference)
+      $q_item->{response_obj}= $response_obj;
+      for (grep defined, $q_item->{promise}, $response_obj->promise) {
+         # TODO: check for various types of Future or Promise APIs.
+         if ($q_item->{error}) {
+            $_->reject($response_obj);
+         } else {
+            $_->resolve($response_obj);
+         }
+      }
    }
 }
 
@@ -297,8 +317,9 @@ then the socket is closed by both.
 
 sub quit {
    my $self= shift;
-   $self->send_command(QUIT => {});
+   my $req= $self->send_command(QUIT => {});
    $self->io->flush('EOF');
+   return $req;
 }
 
 sub _dump_buf {

@@ -13,7 +13,7 @@ subtest simple_helo_session => sub {
    $server_sock->blocking(0);
    my $client= new_ok( 'Email::MTA::Toolkit::SMTP::Client', [ io => $client_sock ] );
    my $server= new_ok( 'Email::MTA::Toolkit::SMTP::Server', [ io => $server_sock, server_domain => 'example.com' ] );
-   my $do_io= sub { while (grep $_, $client->handle_io, $server->handle_io) {} };
+   my $do_io= sub { while ($client->handle_io | $server->handle_io) {} };
    &$do_io;
    my $res= $client->ehlo('client.example.com');
    &$do_io;

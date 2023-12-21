@@ -20,17 +20,19 @@ argument of a scalar to B<overwrite> the output buffer with, but the scalar
 used as the buffer does not change.
 
 You may modify the buffer however you like.  Any data in the buffer may be
-written and removed from the buffer across calls to L</flush>.
+written and removed from the buffer during calls to L</flush>.
 
 =head2 ofinal
 
-Error or shutdown status of the stream connected to the buffer.
+Error or shutdown status of the stream connected to the buffer.  This remains
+C<undef> as long as the stream is still usable.
 
 Shutdown is indicated by the EOF flag (which is numeric 0 but 'EOF' in string
-context), and any other value is the C<< $! >> of the fatal error (which is also
-a dual number/string).
+context), and any other value is the C<< $! >> of the fatal error (which is
+also a dual number/string).
 
-Transient errors are not reported here, because the buffer could still flush in the future.
+Transient errors (EAGAIN, EINTR, EWOULDBLOCK and so on) are not reported here,
+because the buffer could still flush in the future.
 
 =cut
 
