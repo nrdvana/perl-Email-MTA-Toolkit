@@ -25,24 +25,40 @@ sub handle_io {
       if $log->is_trace && $self->io->ibuf_avail;
    while (1) {
       $self->last_parse_error(undef);
-      my $req= $self->parse_command_if_complete($self->io->ibuf);
-      # Come back later if it can't parse more because temporarily out of data
-      last unless $req || defined $self->last_parse_error || $self->io->ifinal;
-      $forward_progress= 1;
-      if ($req) {
-         $self->handle_command($req);
-      } elsif (defined $self->last_parse_error) {
+      if ($self->state eq 'data') {
+         if (defined (my $text= $self->parse_maildata($self->io->ibuf))) {
+            $forward_progress= 1;
+            if ($text eq '') {
+               $self->state('data_complete');
+               my $res= $self->handle_maildata_end;
+               $self->send_response(@$res) if $res;
+            } else {
+               $self->handle_maildata($text);
+            }
+            next;
+         }
+      }
+      else {
+         if (defined (my $req= $self->parse_command_if_complete($self->io->ibuf))) {
+            $forward_progress= 1;
+            $self->handle_command($req);
+            next;
+         }
+      }
+      if (defined $self->last_parse_error) {
          my @err= ( $self->last_parse_error );
          @err= $err[0]->@* if ref $err[0] eq 'ARRAY';
          unshift @err, 500 unless $err[0] =~ /^[0-9]{3}/;
          $self->send_response(@err);
-      } else {
+      } elsif ($self->io->ifinal) {
          if ($self->state ne 'quit') {
             $self->send_response(503, 'Unexpected EOF, terminating connection');
             $self->state('abort');
          }
          return 0;
       }
+      # Come back later if it can't parse more because temporarily out of data
+      else { last; }
    }
    return $forward_progress;
 }
@@ -57,6 +73,7 @@ sub send_response {
    $log->tracef("SMTP Server out: '%s'", _dump_buf(substr($self->io->obuf, $n)))
       if $log->is_trace;
    $self->io->flush($code == 221 || $code == 421? ('EOF') : ());
+   $self->state('data') if $code == 354;
    return $code;
 }
 
@@ -70,7 +87,7 @@ sub handle_command {
    my $handler= $self->can('handle_cmd_'.$req->{command})
       or return $self->send_response(502, "Command not implemented");
    my $res= $self->$handler($req);
-   $self->send_response(@$res);
+   $self->send_response(@$res) if $res;
 }
 
 =item handle_cmd_EHLO
@@ -99,6 +116,8 @@ sub handle_cmd_EHLO {
          : defined $v && length $v? ($v)
          : ();
    }
+
+   $self->state('ready');
    return \@ret;
 }
 
@@ -117,6 +136,8 @@ sub handle_cmd_HELO {
 
    my $domain= $self->server_helo // $self->server_domain
       || Carp::croak('Must define server_helo or server_domain');
+
+   $self->state('ready');
    return ( 250, $domain );
 }
 
@@ -130,9 +151,9 @@ and C<data> file handle, then returns a 250 reply.
 
 sub handle_cmd_MAIL {
    my ($self, $command)= @_;
-   $self->from($command->{path});
-   $self->to([]);
-   $self->data(undef);
+   my $path= Email::MTA::Toolkit::SMTP::EnvelopeRoute->coerce($command->{path});
+   $self->mail_transaction($self->new_transaction(reverse_path => $path));
+   $self->state('mail');
    return [ 250, 'OK' ];
 }
 
@@ -145,9 +166,8 @@ It pushes the new path onto the C<to> attribute, then returns a 250 reply.
 
 sub handle_cmd_RCPT {
    my ($self, $command)= @_;
-   return [ 503, 'Bad sequence of commands' ]
-      unless $self->commands->{RCPT}{states}{$self->state};
-   push @{$self->to}, $command->{path};
+   my $path= Email::MTA::Toolkit::SMTP::EnvelopeRoute->coerce($command->{path});
+   push @{ $self->mail_transaction->forward_paths }, $path;
    return [ 250, 'OK' ];
 }
 
@@ -156,16 +176,51 @@ sub handle_cmd_RCPT {
 If there is a sender and at least one recipient, this changes the server state
 to 'data', and sends a 354 response.  Else it returns an appropriate error code.
 State 'data' changes from parsing commands to parsing data lines
-(L</parse_data>, L</handle_data>, L</handle_data_end>).
+(L</parse_maildata>, L</handle_maildata>, L</handle_maildata_end>).
 
 =cut
 
 sub handle_cmd_DATA {
    my $self= shift;
-   @{$self->mail_transaction->{recipients}}
-      or return [ 503, 'Require RCPT before DATA' ];
-   $self->state('data');
+   @{$self->mail_transaction->{forward_paths}}
+      or return [ 554, 'No valid recipients' ];
    return [ 354, 'Start mail input; end with <CRLF>.<CRLF>' ]
+}
+
+=item handle_maildata
+
+  $server->handle_maildata($text);
+
+This is called every time a chunk of mail data text lines are read from the
+connection.  Currently, this will always be whole lines and will always end
+with the official "\r\n" terminators.
+
+The default action is to call C<< ->mail_transaction->append_data >>.
+
+=item handle_maildata_end
+
+  $server->handle_maildata_end();
+
+This is called after the final mail data lines have been received.
+
+The default action is to drop the mail message with code 554, since this
+module can't know what you wanted to do with the transaction.
+
+=cut
+
+sub handle_maildata {
+   my $self= shift;
+   $self->state eq 'data'
+      or croak "Expected state 'data'";
+   $self->mail_transaction->append_data($_[0]);
+}
+
+sub handle_maildata_end {
+   my $self= shift;
+   $self->state eq 'data_complete'
+      or croak "Expected state 'data'";
+   $self->state('ready');
+   return [ 554, 'Message handler not implemented' ]
 }
 
 =item handle_cmd_QUIT

@@ -194,6 +194,7 @@ sub new_transaction {
       server_ehlo_keywords => $self->server_ehlo_keywords,
       client_domain        => $self->client_domain,
       client_helo          => $self->client_helo,
+      forward_paths        => [],
       @_
    );
 }
@@ -345,7 +346,7 @@ attribute.
 =cut
 
 $commands{RCPT}= {
-   states     => { ready => 1 },
+   states     => { mail => 1 },
    attributes => { to => 1 },
    parse      => sub($self) {
       /^RCPT TO:/gci
@@ -445,6 +446,30 @@ sub parse_command_if_complete {
    push @{$ret->{warnings}}, 'Missing CR at end of line'
       unless $eol eq "\r\n";
    return $ret;
+}
+
+sub parse_maildata {
+   if (@_ > 1) {
+      # Function operates on $_, not @_, but be nice to callers who try
+      # to pass the buffer as an argument.
+      return $_[0]->parse_maildata for $_[1];
+   }
+   my $self= $_[0];
+   # only return whole lines, but return as many as possible if they are not special cases
+   return $& if /\G( (?: [^.\r\n] [^\r\n]* | \. [^.\r\n] [^\r\n]* )? \r\n )+/gcx;
+   # Match anything with a \n in it.
+   return undef unless /\G ([^\r\n]*) (\r?\n) /gcx;
+   # Leading double dot gets one dot removed
+   return substr($1,1)."\r\n" if substr($1,0,2) eq '..';
+   # The RFC says that .\n must never be seen as the terminator of DATA,
+   # so only consider exactly ".\r\n"
+   return '' if $& eq ".\r\n";
+   # and that we shouldn't be allowing optional \r anyway.
+   # but maybe optionally relax this.
+   return _undef_with_err($self, 'Missing CR at end of line in DATA')
+      unless length $2 == 1;
+   # If we do relax it, this line could get reached.
+   return $1."\r\n";
 }
 
 =head2 parse_response_if_complete

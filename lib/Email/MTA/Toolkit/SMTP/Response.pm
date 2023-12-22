@@ -66,7 +66,8 @@ Convert a mesage to lines of protocol ending with CRLF.
 
 sub render {
    my $self= shift;
-   return $self->protocol->render_response($self);
+   return defined $self->code? $self->protocol->render_response($self)
+      : '(pending)';
 }
 
 1;

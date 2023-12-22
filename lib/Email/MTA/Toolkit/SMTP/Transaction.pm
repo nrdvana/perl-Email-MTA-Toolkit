@@ -1,6 +1,7 @@
 package Email::MTA::Toolkit::SMTP::Transaction;
 use v5.36;
 use Moo;
+use Carp;
 
 =head1 DESCRIPTION
 
@@ -74,7 +75,23 @@ has client_helo          => ( is => 'rw' );
 has client_domain        => ( is => 'rw' );
 has client_address       => ( is => 'rw' );
 has reverse_path         => ( is => 'rw' );
-has forwrd_paths         => ( is => 'rw' );
+has forward_paths        => ( is => 'rw' );
 has data                 => ( is => 'rw' );
+
+sub append_data {
+   my $self= $_[0];
+   if (my $r= ref $self->data) {
+      if ($r eq 'ARRAY') {
+         push @{ $self->data }, $_[1];
+      } elsif ($r->can('print')) {
+         $self->data->print($_[1]);
+      } else {
+         croak "Don't know how to append data to $r";
+      }
+   } else {
+      $self->{data} //= '';
+      $self->{data} .= $_[1];
+   }
+}
 
 1;

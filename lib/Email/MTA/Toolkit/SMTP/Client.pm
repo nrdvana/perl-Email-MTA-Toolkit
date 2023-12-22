@@ -88,7 +88,11 @@ sub handle_io {
             $q_item->{error}= 'Unexpected end of stream';
          }
          $self->_update_state_after_response($q_item);
-         $self->_dispatch_response($q_item);
+         # If the item got re-queued, don't resolve the promise yet.
+         # This happens when the DATA command was successful and the user
+         # already supplied the data to send.
+         $self->_dispatch_response($q_item)
+            unless $q_item == ($self->_pending_request_queue->[0] || 0);
       }
    }
    if ($self->io->ifinal && !$self->io->ibuf_avail) {
@@ -111,8 +115,7 @@ sub _update_state_after_response {
       if ($code == 220) {
          $self->state('handshake');
          $self->greeting(join "\n", $q_item->{message_lines}->@*);
-      }
-      else {
+      } else {
          ...
       }
    }
@@ -120,8 +123,45 @@ sub _update_state_after_response {
       if ($code == 250) {
          $self->server_helo($q_item->{message_lines}[0]);
          $self->state('ready');
+      } else {
+         ...
       }
-      else {
+   }
+   elsif ($command eq 'MAIL') {
+      if ($code == 250) {
+         $self->state('mail');
+      } else {
+         ...
+      }
+   }
+   elsif ($command eq 'DATA') {
+      if ($self->state eq 'mail') {
+         if ($code == 354) {
+            $self->state('data');
+            # if the user already supplied the data, send it now,
+            # and re-queue this item.
+            if (defined $q_item->{data}) {
+               unshift @{$self->_pending_response_queue}, $q_item;
+               $q_item->{_write_data_state}= 0;
+               $self->_write_data for delete $q_item->{data};
+               $self->_write_data_end;
+            }
+         } else {
+            ...
+         }
+      } elsif ($self->state eq 'data_complete') {
+         #if ($code == 250) {
+            $self->state('ready');
+         #} elsif ($code >= 400) {
+         #}
+      } else {
+         ...
+      }
+   }
+   elsif ($command eq 'QUIT') {
+      if ($code == 221) {
+         $self->state('quit');
+      } else {
          ...
       }
    }
@@ -225,82 +265,154 @@ sub rcpt_to {
 
 =item data
 
-  $request= $smtp->data($text);
-  $request= $smtp->data(\$text);
-  $request= $smtp->data($filehandle);
-  $request= $smtp->data(\@lines);
+  $request= $smtp->data();
+  $request= $smtp->data($mail_message);
 
-Send the DATA command.  Arguments will be queued like from the L</more_data>
-command, but no data lines will be sent until the server replies a 354
-"continue" response to the DATA command.  After the data transfer is complete,
-the C<$request> gets updated again with either a success or failure reply.
+Send the DATA command.  If you supply a C<$mail_message>, it will be held until
+a successful response is received for the DATA command and then transmitted as
+per the L</write_data> and L</end_data> methods.  In this case, the C<$request>
+will not be updated until sending is complete, and the response code will be
+the server's response to the completed message.  C<$mail_message> must also be
+the complete data to send.
 
-If you supply data arguments to this method, it is assumed they hold the
-complete data, and you cannot then call L</more_data> or L</end_data>.
+If you do I<not> supply C<$mail_message>, the C<$request> will be updated with
+the server's response to your request to send mail, and you need to wait for
+that (and have a successful response) before calling C<write_data>.
 
-=item more_data
+=item write_data
 
-  $smtp->more_data($text);
-  $smtp->more_data(\$text);
-  $smtp->more_data($filehandle);
-  $smtp->more_data(\@lines);
+  $smtp->write_data($text);
 
-Queue additional data or data lines.
+Queue additional data or data lines into the obuf, correctly "do-stuffing"
+them.  After a successful response to the DATA command, you may begind writing
+the message body, but you can't just append it to the C<< io->obuf >> because
+the protocol requires you to double any leading C<'.'> characters, and always
+use "\r\n" line endings.  This function correctly encodes the data, and keeps
+track of the state so that you can write chunks that might break in the middle
+of a line of text and still get it encoded correctly.
 
-Parameters of C<$text> or C<\$text> are treated as a buffer.  The buffer is
-split on "\n", and all lines get "upgraded" to "\r\n" line endings.
+When you are done writing data, call L</end_data>, which writes the trailing
+C<".\r\n"> to signal the end of the data to the server.
 
-A parameter of C<$filehandle> gets read and split like a literal data buffer.
+If you C<don't> call C<end_data>, this does not call C<< ->io->flush >> and
+you should consider whether you want to do that.
 
-An arrayref parameter gets treated as individual text lines, where each line
-is upgraded to end with "\r\n" (even if it had no previous line ending) and
-occurrence of "\n" or "\r" anywhere in the middle of the string is an error.
-
-All strings should be 7-bit ascii, unless an 8-bit extension was negotiated.
+All text should be 7-bit ASCII unless you have negotiated 8-bit with the server.
 
 =item end_data
 
   $smtp->end_data
 
-Call this after the last L</more_data>, to indicate the end of the data and
-allow the terminating line to be sent.
+Call this after the last L</write_data> to indicate the end of the data and
+allow the terminating line to be sent.  This also calls C<< ->io->flush >>.
 
 =cut
 
 sub data {
    my $self= shift;
-   my $req= $self->send_command({ command => 'DATA' });
-   if (@_) {
-      $self->more_data(@_);
-      $self->end_data;
+   my $req= $self->send_command(DATA => {});
+   if (defined $_[0]) {
+      $self->_pending_request_queue->[-1]{data}= shift;
    }
    return $req;
 }
 
-sub more_data {
-   my $self= shift;
+sub write_data {
+   my $self= $_[0];
+   @_ == 2 or croak "Expected a single data parameter";
    $self->state eq 'data'
-      or croak "more_data can only be called after sending DATA command";
-   if (@_ == 1 && (!ref $_[0] || ref $_[0] eq 'SCALAR')) {
-      push @{$self->mail_transaction->{data_queue}}, $_[0];
-   } elsif (@_ == 1 && ref $_[0] eq 'ARRAY') {
-      my @data= @{$_[0]};
-      for (@data) {
-         /[\r\n]./ and croak "Embedded newline in lines of text";
-         s/\r?\n?$/\r\n/
-      }
-      push @{$self->mail_transaction->{data_queue}}, join '', @data;
+      or croak "write_data can only be called after sending DATA command";
+   # If there is not a data command on the queue, put one there
+   if (@{$self->_pending_request_queue}) {
+      my $q_item= $self->_pending_request_queue->[0];
+      croak "can't call write_data when another request is queued"
+         unless $q_item && defined $q_item->{_write_data_state};
    } else {
-      croak "Too many arguments to more_data: ".scalar(@_) if @_ > 1;
-      croak "Unhandled more_data arguments  (@_)";
+      push @{$self->_pending_request_queue}, {
+         request => { command => 'DATA' },
+         _write_data_state => 0,
+      };
    }
+   $self->_write_data for $_[1];
+   $self;
 }
 
 sub end_data {
    my $self= shift;
    $self->state eq 'data'
       or croak "end_data can only be called after sending DATA command";
-   $self->mail_transaction->{data_complete}= 1;
+   my $q_item= $self->_pending_request_queue->[0];
+   defined $q_item && defined $q_item->{_write_data_state}
+      or croak "end_data can only be called after write_data";
+   $self->_write_data_end;
+   # If caller wants to see results of this command, create a Response object for them
+   if (defined wantarray) {
+      my $response_obj= $q_item->{response_obj};
+      if (!defined $response_obj) {
+         $response_obj= Email::MTA::Toolkit::SMTP::Response->new(%$q_item, protocol => $self);
+         weaken($q_item->{response_obj}= $response_obj);
+      }
+      return $response_obj;
+   }
+}
+
+sub _write_data {
+   my $self= shift;
+   # Push data from $_ onto the buffer.
+   # If the previous write did not end with a \r\n,
+   # the state is recorded in ->{_write_maildata_state}.
+   #  0 = start of a new line
+   #  1 = within a new line
+   #  2 = wrote a \r but not the \n yet
+   #  3 = finished
+   my $state= $self->_pending_request_queue->[0]{_write_data_state} || 0;
+   croak "Can't write more data after finished" if $state > 2;
+   pos //= 0;
+   while (length > pos) {
+      if ($state == 2) {
+         /\G \n /xgc; # consume the newline if any
+         $self->io->obuf .= "\n";
+         $state= 0;
+      }
+      # common case: complete lines that don't start with dot.
+      # match as many as possible all at once.
+      if (/\G (?: (?: [^.\r\n] [^\r\n]* )? \r\n )+ /xgc) {
+         $self->io->obuf .= $&;
+         $state= 0;
+      }
+      if (length > pos) {
+         # something interrupted the regex above:
+         # leading dot?
+         if ($state == 0 && /\G \. /xgc) {
+            $self->io->obuf .= '..';
+            $state= 1;
+         }
+         # now match anything other than a line terminator
+         if (/\G [^\r\n]+ /xgc) {
+            $self->io->obuf .= $&;
+            $state= 1;
+         }
+         # incomplete line terminator?
+         if (/\G \n /xgc) {
+            $self->io->obuf .= "\r\n";
+            $state= 0;
+         } elsif (/\G \r \Z/xgc) {
+            $self->io->obuf .= "\r";
+            $state= 2;
+         }
+      }
+   }
+   $self->_pending_request_queue->[0]{_write_data_state}= $state;
+}
+sub _write_data_end {
+   my $self= shift;
+   if ($self->_pending_request_queue->[0]{_write_data_state}) {
+      croak "Mail data ended with incomplete line!";
+   }
+   $self->state('data_complete');
+   $self->_pending_request_queue->[0]{_write_data_state}= 3;
+   $self->io->obuf .= ".\r\n";
+   $self->io->flush;
 }
 
 =item quit
